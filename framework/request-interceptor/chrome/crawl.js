@@ -71,7 +71,7 @@ const onRequest = async (options, requestLog, request) => {
 
   const numRequests = requestLog.requests.length
   const logger = chromeLoggerLib.getLoggerForLevel(options.debugLevel)
-  logger.debug('Request '+numRequests+': \033[94m'+requestUrl.split('?', 1).toString().split(';', 1)+'\033[0m')
+  logger.debug('Request '+numRequests+': \x1b[94m'+requestUrl.split('?', 1).toString().split(';', 1)+'\x1b[0m')
 }
 
 const handleWebSocketCreated = async (options, requestLog, webSockets, request) => {
@@ -116,17 +116,27 @@ const handleWebSocketFrameSent = async (options, requestLog, webSockets, request
       })
       const numRequests = requestLog.requests.length
       const logger = chromeLoggerLib.getLoggerForLevel(options.debugLevel)
-      logger.debug('Request '+numRequests+': \033[94m'+requestUrl.split('?', 1).toString().split(';', 1)+'\033[0m')
+      logger.debug('Request '+numRequests+': \x1b[94m'+requestUrl.split('?', 1).toString().split(';', 1)+'\x1b[0m')
       break
     }
   }
 }
 
-const handleResponse = async (options, requestLog, request) => {
+const handleResponse = async (options, requestLog, cdpClient, request) => {
   for (let i = 0; i < requestLog.requests.length; i++) {
     if (requestLog.requests[i].id === request.requestId) {
       requestLog.requests[i].status = request.response.status
       requestLog.requests[i].responseHeaders = normalizeHeaders(request.response.headers)
+      requestLog.requests[i].mimeType = request.response.mimeType || ''
+      // Fetch response body via CDP
+      try {
+        const { body, base64Encoded } = await cdpClient.send('Network.getResponseBody', {
+          requestId: request.requestId
+        })
+        requestLog.requests[i].responseBody = base64Encoded ? '[base64]' : body
+      } catch (e) {
+        requestLog.requests[i].responseBody = ''
+      }
       break
     }
   }
@@ -142,7 +152,7 @@ const handleResponseExtraInfo = async (options, requestLog, response) => {
 }
 
 const onClose = async (options, page) => {
-  console.log('Page closed: \033[94m'+page.url()+'\033[0m')
+  console.log('Page closed: \x1b[94m'+page.url()+'\x1b[0m')
 }
 
 const onTargetCreated = async (options, requestLog, webSockets, cdpClients, target) => {
@@ -158,12 +168,173 @@ const onTargetCreated = async (options, requestLog, webSockets, cdpClients, targ
   await cdpClient.send('Page.enable')
   cdpClient.on('Network.webSocketCreated', handleWebSocketCreated.bind(undefined, options, requestLog, webSockets))
   cdpClient.on('Network.webSocketFrameSent', handleWebSocketFrameSent.bind(undefined, options, requestLog, webSockets))
-  cdpClient.on('Network.responseReceived', handleResponse.bind(undefined, options, requestLog))
+  cdpClient.on('Network.responseReceived', handleResponse.bind(undefined, options, requestLog, cdpClient))
   cdpClient.on('Network.responseReceivedExtraInfo', handleResponseExtraInfo.bind(undefined, options, requestLog))
   cdpClients.push(cdpClient)
 
   const logger = chromeLoggerLib.getLoggerForLevel(options.debugLevel)
   logger.debug('Completed configuring new page. ('+page.url()+')')
+}
+
+/**
+ * Crawl a single URL using an already-launched browser.
+ * @param {Object} browser - Puppeteer browser instance
+ * @param {Object} requestLog - Shared request log object (must have a .requests array).
+ *                               Network handlers append captured requests here.
+ * @param {Array}  cdpClients - Shared array of CDP clients (populated by onTargetCreated)
+ * @param {string} url - URL to crawl
+ * @param {Object} args - Crawl args (debugLevel, secs, links, etc.)
+ * @param {Object} logger - Logger instance
+ * @param {boolean} skipImport - If true, skip MetaMask wallet import (already imported)
+ * @returns {Object} Crawl result log
+ */
+const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skipImport = false) => {
+  const log = Object.create(null)
+  log.url = url
+  log.cookies = []
+  log.success = true
+  log.connected = false
+  log.pageSrc = ''
+  log.redirectedUrl = ''
+
+  // Clear request log for this crawl
+  const requestsBefore = requestLog.requests.length
+
+  let pages = await browser.pages()
+  let page = await pages[0]
+  page.close()
+  page = await browser.newPage()
+
+  // Wait for wallet page to load
+  await sleep(2)
+  pages = await browser.pages()
+
+  if (!skipImport) {
+    const wallet = await pages[pages.length - 1]
+    await wallet.bringToFront();
+
+    // Import wallet
+    try {
+      wallet.setDefaultNavigationTimeout(0)
+      await importMetaMaskWallet(logger, wallet)
+    } catch {
+      logger.debug('\x1b[91mFailed to import wallet!\x1b[0m')
+    }
+  }
+
+  logger.debug(`Visiting ${url}`)
+  await page.goto(url, {waitUntil: "domcontentloaded"})
+  await page.bringToFront()
+
+  const client = await page.target().createCDPSession();
+  await client.send('Page.enable');
+
+  // Capture redirected URL and page source
+  log.redirectedUrl = page.url()
+  try {
+    log.pageSrc = await page.content()
+  } catch (e) {
+    log.pageSrc = ''
+  }
+
+  // Capture HTTP status from the main navigation request
+  log.status = 0
+  for (let i = requestsBefore; i < requestLog.requests.length; i++) {
+    if (requestLog.requests[i].url === url || requestLog.requests[i].url === log.redirectedUrl) {
+      log.status = requestLog.requests[i].status || 0
+      break
+    }
+  }
+
+  // Connect to DApp
+  try {
+    page.setDefaultNavigationTimeout(0)
+    page.setDefaultTimeout(0)
+    let result = await connectMetaMaskWallet(logger, page, browser)
+    log.connected         = result[0];
+    log.connect_label     = result[1];
+    log.metamask_label    = result[2];
+    log.checkbox_clicked  = result[3];
+    log.signature_request = result[4];
+    log.switch_network    = result[5];
+  } catch (error) {
+    logger.debug('\x1b[91mFailed to connect to '+url+'!\x1b[0m')
+    console.log(error);
+  }
+
+  if (args.links === undefined) {
+    // Wait a certain time and do nothing
+    const waitTimeMs = (args.secs || 10) * 1000
+    logger.debug(`Waiting for ${waitTimeMs}ms`)
+    await page.waitForTimeout(waitTimeMs)
+  } else {
+    // Interact with DApp
+    let counter = 0;
+    let hrefs = await page.$$eval('a', as => as.map(a => a.href));
+    while (counter < args.links) {
+      counter += 1;
+      let new_hrefs = await page.$$eval('a', as => as.map(a => a.href));
+      hrefs = hrefs.concat(new_hrefs);
+      hrefs = removeDuplicates(hrefs);
+      hrefs = removeEmptyStrings(hrefs);
+      let same_origin = []
+      let domain_original = (new URL(url));
+      for (const link of hrefs) {
+        let domain = (new URL(link));
+        if (domain.hostname.includes(domain_original.hostname)) {
+          same_origin.push(link);
+        }
+      }
+      hrefs = same_origin;
+      logger.debug('Found '+hrefs.length+' links on DApp page: '+page.url());
+      if (hrefs.length > 0) {
+        random_link = getRandomItem(hrefs);
+        logger.debug('Visiting '+random_link);
+        await Promise.all([
+            page.waitForNavigation(),
+            page.goto(random_link, {waitUntil: "domcontentloaded"})
+        ]);
+      } else {
+        break;
+      }
+    }
+  }
+
+  // Update page source after wallet interaction and dwell time
+  try {
+    log.pageSrc = await page.content()
+    log.redirectedUrl = page.url()
+  } catch (e) {}
+
+  // Collect requests captured during this crawl
+  log.requests = requestLog.requests.slice(requestsBefore)
+
+  // Save all cookies
+  log.cookies = []
+  try {
+    let cookies = (await client.send('Network.getAllCookies')).cookies
+    for (let i = 0; i < cookies.length; i++) {
+      if (log.cookies.indexOf(cookies[i]) == -1) {
+        log.cookies.push(cookies[i])
+      }
+    }
+  } catch {}
+  for (const cdpClient of cdpClients) {
+    try {
+      let cookies = (await cdpClient.send('Network.getAllCookies')).cookies
+      for (let i = 0; i < cookies.length; i++) {
+        if (log.cookies.indexOf(cookies[i]) == -1) {
+          log.cookies.push(cookies[i])
+        }
+      }
+    } catch {}
+  }
+
+  try {
+    await page.close()
+  } catch  {}
+
+  return log
 }
 
 const crawl = async args => {
@@ -309,130 +480,20 @@ const crawl = async args => {
       logger.debug("Finished interacting with wallet extension.")
       log.success = true
     } else {
-      const url = args.url
-
-      log.url = url
-      log.cookies = []
-      log.success = true
-      log.connected = false
-
-      let pages = await browser.pages()
-      let page = await pages[0]
-      page.close()
-      page = await browser.newPage()
-
-      // Wait for wallet page to load
-      await sleep(2)
-      pages = await browser.pages()
-
-      const wallet = await pages[pages.length - 1]
-      await wallet.bringToFront();
-
-      // Import wallet
-      try {
-        wallet.setDefaultNavigationTimeout(0)
-        await importMetaMaskWallet(logger, wallet)
-      } catch {
-        logger.debug('\033[91mFailed to import wallet!\033[0m')
-      }
-
-      logger.debug(`Visiting ${url}`)
-      await page.goto(url, {waitUntil: "domcontentloaded"})
-      await page.bringToFront()
-
-      const client = await page.target().createCDPSession();
-      await client.send('Page.enable');
-
-      // Connect to DApp
-      try {
-        page.setDefaultNavigationTimeout(0)
-        page.setDefaultTimeout(0)
-        let result = await connectMetaMaskWallet(logger, page, browser)
-        log.connected         = result[0];
-        log.connect_label     = result[1];
-        log.metamask_label    = result[2];
-        log.checkbox_clicked  = result[3];
-        log.signature_request = result[4];
-        log.switch_network    = result[5];
-      } catch (error) {
-        logger.debug('\033[91mFailed to connect to '+url+'!\033[0m')
-        console.log(error);
-      }
-
-      if (args.links === undefined) {
-        // Wait a certain time and do nothing
-        const waitTimeMs = args.secs * 1000
-        logger.debug(`Waiting for ${waitTimeMs}ms`)
-        await page.waitForTimeout(waitTimeMs)
-      } else {
-        // Interact with DApp
-        let counter = 0;
-        let hrefs = await page.$$eval('a', as => as.map(a => a.href));
-        while (counter < args.links) {
-          counter += 1;
-          let new_hrefs = await page.$$eval('a', as => as.map(a => a.href));
-          hrefs = hrefs.concat(new_hrefs);
-          hrefs = removeDuplicates(hrefs);
-          hrefs = removeEmptyStrings(hrefs);
-          let same_origin = []
-          let domain_original = (new URL(url));
-          for (const link of hrefs) {
-            let domain = (new URL(link));
-            if (domain.hostname.includes(domain_original.hostname)) {
-              same_origin.push(link);
-            }
-          }
-          hrefs = same_origin;
-          logger.debug('Found '+hrefs.length+' links on DApp page: '+page.url());
-          if (hrefs.length > 0) {
-            random_link = getRandomItem(hrefs);
-            logger.debug('Visiting '+random_link);
-            await Promise.all([
-                page.waitForNavigation(),
-                page.goto(random_link, {waitUntil: "domcontentloaded"})
-            ]);
-          } else {
-            break;
-          }
-        }
-      }
-
-      // Save all cookies
-      log.cookies = []
-      try {
-        let cookies = (await client.send('Network.getAllCookies')).cookies
-        for (let i = 0; i < cookies.length; i++) {
-          if (log.cookies.indexOf(cookies[i]) == -1) {
-            log.cookies.push(cookies[i])
-          }
-        }
-      } catch {}
-      for (const cdpClient of cdpClients) {
-        try {
-          let cookies = (await cdpClient.send('Network.getAllCookies')).cookies
-          for (let i = 0; i < cookies.length; i++) {
-            if (log.cookies.indexOf(cookies[i]) == -1) {
-              log.cookies.push(cookies[i])
-            }
-          }
-        } catch {}
-      }
-
-      try {
-        await page.close()
-      } catch  {}
+      const urlResult = await crawlUrl(browser, log, cdpClients, args.url, args, logger)
+      Object.assign(log, urlResult)
     }
   } catch (error) {
     log.success = false
     log.msg = error.toString()
-    logger.debug('\033[91mCaught error when crawling: for '+log.msg+'\033[0m')
+    logger.debug('\x1b[91mCaught error when crawling: for '+log.msg+'\x1b[0m')
   }
 
   try {
     logger.debug('Trying to shutdown')
     await browser.close()
   } catch (e) {
-    logger.debug('\033[91mError when shutting down: '+e.toString()+'\033[0m')
+    logger.debug('\x1b[91mError when shutting down: '+e.toString()+'\x1b[0m')
   }
 
   log.timestamps.end = Date.now()
@@ -465,5 +526,7 @@ const click = async (elHandle, loginRegisterLinkAttrs, method = "method1", page)
 }
 
 module.exports = {
-  crawl
+  crawl,
+  crawlUrl,
+  timeoutPromise
 }

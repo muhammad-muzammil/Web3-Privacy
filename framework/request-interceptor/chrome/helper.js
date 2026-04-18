@@ -21,7 +21,8 @@ const waitForNavigation = async (page, maxWaitTimeInMillisecs) => {
 async function importMetaMaskWallet(logger, page) {
     logger.debug('\033[94mTrying to import MetaMask connect...\033[0m');
 
-    const credentials = JSON.parse(fs.readFileSync('metamask_credentials.json'));
+    const credPath = process.env.METAMASK_CREDENTIALS || 'metamask_credentials.json';
+    const credentials = JSON.parse(fs.readFileSync(credPath));
 
     // Click get started button
     const get_started_button = await page.waitForXPath('//*[@id="app-content"]/div/div[2]/div/div/div/button');

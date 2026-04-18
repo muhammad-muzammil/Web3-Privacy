@@ -1,3 +1,4 @@
+const path = require('path')
 const puppeteerExtraLib = require('puppeteer-extra')
 const puppeteerExtraPluginStealthLib = require('puppeteer-extra-plugin-stealth')
 const { getLogger } = require('./logging')
@@ -18,8 +19,9 @@ const launch = async args => {
   puppeteerArgs.args.push(`--disable-dev-shm-usage`)
 
   if (args.walletPath) {
-    puppeteerArgs.args.push(`--disable-extensions-except=${args.walletPath}`)
-    puppeteerArgs.args.push(`--load-extension=${args.walletPath}`)
+    const resolvedWalletPath = path.resolve(args.walletPath)
+    puppeteerArgs.args.push(`--disable-extensions-except=${resolvedWalletPath}`)
+    puppeteerArgs.args.push(`--load-extension=${resolvedWalletPath}`)
   }
 
   if (args.profilePath) {
