@@ -220,7 +220,8 @@ async function main() {
   const consumer = kafka.consumer({
     groupId: KAFKA_GROUP,
     maxWaitTimeInMs: 10000,
-    sessionTimeout: 60000,
+    sessionTimeout: 120000,
+    heartbeatInterval: 10000,
     maxPollIntervalMs: 900000
   });
 
@@ -273,6 +274,7 @@ async function main() {
       let crawlLog = null;
       for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
         try {
+          await heartbeat();
           logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
           const crawlPromise = crawlUrl(
             session.browser,
