@@ -1,6 +1,7 @@
 FROM node:20-slim
 
 RUN apt-get update && apt-get install -y \
+    chromium \
     wget \
     curl \
     unzip \
@@ -44,6 +45,7 @@ COPY metamask-chrome-10.22.2/ ./metamask-chrome-10.22.2/
 ENV TZ=America/New_York
 ENV DISPLAY=:99
 ENV METAMASK_PATH=./metamask-chrome-10.22.2
+ENV CHROME_PATH=/usr/bin/chromium
 
 # Start xvfb (needed for extensions) then run the crawler
 CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 & node kafka-crawl.js"]

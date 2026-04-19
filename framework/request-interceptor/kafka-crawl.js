@@ -83,7 +83,7 @@ async function startBrowser() {
     walletPath: METAMASK_PATH,
     profilePath,
     printFrameHierarchy: false,
-    executablePath: undefined // Use Puppeteer's bundled Chromium
+    executablePath: process.env.CHROME_PATH, // Use installed Chromium
   };
 
   const browser = await chromePuppeteerLib.launch(args);
