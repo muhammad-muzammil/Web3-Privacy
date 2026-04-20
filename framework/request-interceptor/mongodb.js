@@ -73,7 +73,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
             pageSrc: { $ifNull: ['$pageSrc', pageSrc] },
             additionalRequests: { $ifNull: ['$additionalRequests', additionalRequests] },
             interactions: { $ifNull: ['$interactions', interactions] },
-            crawlerType: { $ifNull: ['$crawlerType', crawlerType] },
+            // crawlerType: { $ifNull: ['$crawlerType', crawlerType] },
             followups: {
               $cond: {
                 if: { $isArray: '$followups' },

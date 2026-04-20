@@ -28,6 +28,7 @@ const CRAWL_TIMEOUT = parseInt(process.env.CRAWL_TIMEOUT || '30', 10) * 1000;
 const SITES_PER_SESSION = parseInt(process.env.SITES_PER_SESSION || '100', 10);
 const DEBUG_LEVEL = process.env.DEBUG_LEVEL || 'none';
 const MAX_CRAWL_RETRIES = 3;
+var session_dead = false;
 
 const logger = chromeLoggerLib.getLoggerForLevel(DEBUG_LEVEL);
 
@@ -70,6 +71,7 @@ async function startBrowser() {
   // crawls in this session so MetaMask state (imported once at session start)
   // survives between URLs. Deleted on session refresh — see main() — mimicking
   // sel-wire.py's per-launch profile cleanup.
+
   const profilePath = path.join(os.tmpdir(), `wallet-crawler-profile-${Date.now()}-${process.pid}`);
   try {
     fs.mkdirSync(profilePath, { recursive: true });
@@ -135,6 +137,8 @@ async function startBrowser() {
         mimeType: ''
       });
     });
+    browser.on('disconnected', () => { sessionDead = true });
+    
 
     const cdpClient = await page.target().createCDPSession();
     await cdpClient.send('Network.enable');
@@ -231,6 +235,7 @@ async function main() {
   await producer.connect();
   await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: true });
 
+  let consecutiveFailures = 0;
   let siteCounter = 0;
   let session = await startBrowser();
 
@@ -245,7 +250,7 @@ async function main() {
 
       // Session refresh: tear down the browser AND wipe its user-data-dir, then
       // launch fresh. MetaMask will be re-imported on the new session.
-      if (siteCounter >= SITES_PER_SESSION) {
+      if (siteCounter >= SITES_PER_SESSION || session_dead) {
         logger.debug('Session refresh: restarting browser');
         await destroySession(session);
         session = await startBrowser();
@@ -306,11 +311,19 @@ async function main() {
       // No publish to crawled-urls, no crawls write.
       if (!crawlLog) {
         console.error(`Giving up on ${url} after ${MAX_CRAWL_RETRIES} attempts`);
-        await commitOffset();
-        await heartbeat();
-        siteCounter++;
-        return;
+        consecutiveFailures++;
+          if (consecutiveFailures >= 3) {
+            logger.debug('Rebuilding session after 3 consecutive failures');
+            await destroySession(session);
+            session = await startBrowser();
+            consecutiveFailures = 0;
+          }
+          await commitOffset();
+          await heartbeat();
+          siteCounter++;
+          return;
       }
+      consecutiveFailures = 0;
 
       // Step 4: scan captured requests for non-false-flagged token hits and
       // build the filtered additionalRequests array. Only requests where the
@@ -345,7 +358,7 @@ async function main() {
         const pageSrc = crawlLog.pageSrc || '';
         const interactions = buildInteractions(crawlLog);
 
-        logger.debug(
+        console.log(
           `Interesting crawl for ${url}: ${interestingRequests.length} matching requests, ` +
           `tokens={${Array.from(matchedTokens).join(',')}}, walletInteraction=${anyPrivacyInteraction}`
         );
