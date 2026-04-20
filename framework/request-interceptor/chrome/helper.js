@@ -19,7 +19,7 @@ const waitForNavigation = async (page, maxWaitTimeInMillisecs) => {
   }
 
 async function importMetaMaskWallet(logger, page) {
-    logger.debug('\033[94mTrying to import MetaMask connect...\033[0m');
+    console.log('\x1b[94mTrying to import MetaMask connect...\x1b[0m');
 
     const credPath = process.env.METAMASK_CREDENTIALS || 'metamask_credentials.json';
     const credentials = JSON.parse(fs.readFileSync(credPath));
@@ -60,7 +60,7 @@ async function importMetaMaskWallet(logger, page) {
     const all_done_button = await page.waitForXPath('//*[@id="app-content"]/div/div[2]/div/div/button');
     await page.evaluate($submit => $submit.click(), all_done_button);
 
-    logger.debug('\033[92mImporting MetaMask wallet was successful!\033[0m');
+    console.log('\x1b[92mImporting MetaMask wallet was successful!\x1b[0m');
  }
 
  async function connectMetaMaskWallet(logger, page, browser, args) {
