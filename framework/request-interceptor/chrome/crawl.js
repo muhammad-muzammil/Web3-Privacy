@@ -250,10 +250,19 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
   try {
     page.setDefaultNavigationTimeout(30000)
     page.setDefaultTimeout(15000)
-    let result = await Promise.race([
-      connectMetaMaskWallet(logger, page, browser),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('wallet connect hard timeout')), 30000))
-    ]);
+    try {
+      let result = await Promise.race([
+        connectMetaMaskWallet(logger, page, browser),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('wallet connect hard timeout')), 40000))
+      ]);
+    } catch (err) {
+      if (/wallet connect hard timeout/.test(err.message)) {
+        try { 
+          await page.close({ runBeforeUnload: false });
+        } catch {}
+      }
+      throw err;
+    }
     log.connected         = result[0];
     log.connect_label     = result[1];
     log.metamask_label    = result[2];
