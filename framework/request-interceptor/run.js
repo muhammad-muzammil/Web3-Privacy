@@ -7,7 +7,7 @@ const chromeCrawlLib = require('./chrome/crawl.js')
 const chromeLoggerLib = require('./chrome/logging.js')
 const chromeValidateLib = require('./chrome/validate.js')
 
-const defaultDebugSetting = 'none'
+const defaultDebugSetting = 'debug'
 
 const parser = new argparseLib.ArgumentParser({
   add_help: true,
