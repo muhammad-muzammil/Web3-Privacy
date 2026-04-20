@@ -180,7 +180,7 @@ async function startBrowser() {
     try {
       wallet.setDefaultNavigationTimeout(0);
       await importMetaMaskWallet(logger, wallet);
-      console.log('MetaMask wallet imported successfully');
+      console.error('MetaMask wallet imported successfully');
     } catch (e) {
       console.error('Failed to import MetaMask wallet: ' + e.toString());
     }
