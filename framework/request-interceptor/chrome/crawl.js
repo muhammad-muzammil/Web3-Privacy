@@ -223,7 +223,7 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
   }
 
   logger.debug(`Visiting ${url}`)
-  await page.goto(url, {waitUntil: "domcontentloaded"})
+  await page.goto(url, {waitUntil: "domcontentloaded", timeout: 25000})
   await page.bringToFront()
 
   const client = await page.target().createCDPSession();
@@ -248,9 +248,12 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
 
   // Connect to DApp
   try {
-    page.setDefaultNavigationTimeout(0)
-    page.setDefaultTimeout(0)
-    let result = await connectMetaMaskWallet(logger, page, browser)
+    page.setDefaultNavigationTimeout(30000)
+    page.setDefaultTimeout(15000)
+    let result = await Promise.race([
+      connectMetaMaskWallet(logger, page, browser),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('wallet connect hard timeout')), 30000))
+    ]);
     log.connected         = result[0];
     log.connect_label     = result[1];
     log.metamask_label    = result[2];
@@ -292,7 +295,7 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
         logger.debug('Visiting '+random_link);
         await Promise.all([
             page.waitForNavigation(),
-            page.goto(random_link, {waitUntil: "domcontentloaded"})
+            page.goto(random_link, {waitUntil: "domcontentloaded", timeout: 25000})
         ]);
       } else {
         break;

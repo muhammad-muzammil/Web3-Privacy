@@ -239,6 +239,7 @@ async function main() {
   await consumer.run({
     autoCommit: false,
     eachMessage: async ({ topic, partition, message, heartbeat }) => {
+      console.log(`recv p=${partition} off=${message.offset}`);
       const commitOffset = () =>
         consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
 
@@ -273,15 +274,15 @@ async function main() {
       // sel-wire.py:138-181 — three tries, then move on if still failing.
       let crawlLog = null;
       for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
+        await heartbeat();
         try {
-          await heartbeat();
           logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
           const crawlPromise = crawlUrl(
             session.browser,
             session.requestLog,
             session.cdpClients,
             `https://${url}`,
-            { ...session.args, secs: 30},
+            { ...session.args, secs: 20},
             logger,
             true // skipImport — wallet already imported at session start
           );
