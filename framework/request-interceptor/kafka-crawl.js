@@ -281,11 +281,11 @@ async function main() {
             session.requestLog,
             session.cdpClients,
             `https://${url}`,
-            { ...session.args, secs: Math.floor(30) },
+            { ...session.args, secs: 30},
             logger,
             true // skipImport — wallet already imported at session start
           );
-          const result = await timeoutPromise(crawlPromise, CRAWL_TIMEOUT + 300000);
+          const result = await timeoutPromise(crawlPromise, CRAWL_TIMEOUT);
 
           // timeoutPromise resolves to the literal `1` on timeout.
           if (result === 1) {
