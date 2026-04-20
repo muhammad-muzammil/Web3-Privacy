@@ -303,7 +303,7 @@ async function main() {
           break;
         } catch (e) {
           const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
-          logger.debug(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
+          console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
         }
       }
 
