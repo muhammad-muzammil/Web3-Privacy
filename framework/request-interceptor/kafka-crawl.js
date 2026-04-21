@@ -240,7 +240,9 @@ async function main() {
   let session = await startBrowser();
 
   console.log(`Kafka consumer started. Group: ${KAFKA_GROUP}, Topic: ${KAFKA_TOPIC}`);
-
+  //Session compromised error message flag
+  const SESSION_DEAD_RE = /Target closed|Session closed|Connection closed|Protocol error/;
+  
   await consumer.run({
     autoCommit: false,
     eachMessage: async ({ topic, partition, message, heartbeat }) => {
@@ -278,6 +280,8 @@ async function main() {
       // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
       // sel-wire.py:138-181 — three tries, then move on if still failing.
       let crawlLog = null;
+      //sessionCompromised flag for when browser session fails
+      let sessionCompromised = false;
       for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
         await heartbeat();
         try {
@@ -304,6 +308,10 @@ async function main() {
         } catch (e) {
           const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
           console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
+          if (SESSION_DEAD_RE.test(msg)) {
+            sessionCompromised = true;
+            break;  // no point retrying, browser is dead
+          } 
         }
       }
 
@@ -312,16 +320,23 @@ async function main() {
       if (!crawlLog) {
         console.error(`Giving up on ${url} after ${MAX_CRAWL_RETRIES} attempts`);
         consecutiveFailures++;
-          if (consecutiveFailures >= 3) {
-            logger.debug('Rebuilding session after 3 consecutive failures');
+        siteCounter++;
+        if (sessionCompromised) {
+            console.error('Session compromised — rebuilding');
             await destroySession(session);
             session = await startBrowser();
+            siteCounter = 0;
             consecutiveFailures = 0;
-          }
-          await commitOffset();
-          await heartbeat();
-          siteCounter++;
-          return;
+        }
+        else if (consecutiveFailures >= 3) {
+          console.error('Rebuilding session after 3 consecutive failures');
+          await destroySession(session);
+          session = await startBrowser();
+          consecutiveFailures = 0;
+        }
+        await commitOffset();
+        await heartbeat();
+        return;
       }
       consecutiveFailures = 0;
 

@@ -200,14 +200,11 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
   // Clear request log for this crawl
   const requestsBefore = requestLog.requests.length
 
-  let pages = await browser.pages()
-  let page = await pages[0]
-  page.close()
-  page = await browser.newPage()
+  const page = await browser.newPage()
 
   // Wait for wallet page to load
   await sleep(2)
-  pages = await browser.pages()
+  let pages = await browser.pages()
 
   if (!skipImport) {
     const wallet = await pages[pages.length - 1]
