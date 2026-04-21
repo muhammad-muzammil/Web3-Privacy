@@ -9,7 +9,7 @@
   "providers.Web3Provider(",
   "getSigner(",
   "endCell(",
-  "viem'",
+  "viem",
   "createPublicClient(",
   "createWalletClient(",
   ".readContract(",

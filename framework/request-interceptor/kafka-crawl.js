@@ -85,7 +85,6 @@ async function startBrowser() {
     walletPath: METAMASK_PATH,
     profilePath,
     printFrameHierarchy: false,
-    executablePath: process.env.CHROME_PATH, // Use installed Chromium
   };
 
   const browser = await chromePuppeteerLib.launch(args);
@@ -137,7 +136,7 @@ async function startBrowser() {
         mimeType: ''
       });
     });
-    browser.on('disconnected', () => { sessionDead = true });
+    browser.on('disconnected', () => { session_dead = true });
     
 
     const cdpClient = await page.target().createCDPSession();
@@ -180,7 +179,7 @@ async function startBrowser() {
     try {
       wallet.setDefaultNavigationTimeout(0);
       await importMetaMaskWallet(logger, wallet);
-      console.error('MetaMask wallet imported successfully');
+      console.log('MetaMask wallet imported successfully');
     } catch (e) {
       console.error('Failed to import MetaMask wallet: ' + e.toString());
     }
@@ -308,7 +307,7 @@ async function main() {
         } catch (e) {
           const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
           console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
-          if (SESSION_DEAD_RE.test(msg)) {
+          if (SESSION_DEAD_RE.test(firstLine)) {
             sessionCompromised = true;
             break;  // no point retrying, browser is dead
           } 

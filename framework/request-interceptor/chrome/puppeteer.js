@@ -1,14 +1,17 @@
 const path = require('path')
-const puppeteerExtraLib = require('puppeteer-extra')
+const { addExtra } = require('puppeteer-extra')
 const puppeteerExtraPluginStealthLib = require('puppeteer-extra-plugin-stealth')
 const { getLogger } = require('./logging')
+
+// Force puppeteer-extra to wrap full `puppeteer` (which ships bundled
+// Chromium) rather than auto-resolving `puppeteer-core` (which does not).
+const puppeteerExtraLib = addExtra(require('puppeteer'))
 puppeteerExtraLib.use(puppeteerExtraPluginStealthLib())
 
 const launch = async args => {
   const puppeteerArgs = {
     defaultViewport: null,
     args: [],
-    executablePath: args.executablePath,
     headless: args.headless
   }
   puppeteerArgs.args.push(`--start-maximized`)
