@@ -34,7 +34,7 @@ const logger = chromeLoggerLib.getLoggerForLevel(DEBUG_LEVEL);
 
 // Load search_terms / false_flags once at startup. Both files live next to
 // this script (resolved by match.js via __dirname).
-const { searchTerms, falseFlags } = loadConfig();
+const { searchTerms, falseFlags, urlTerms } = loadConfig();
 
 /**
  * Parse URL from Certificate Transparency stream message.
@@ -347,7 +347,7 @@ async function main() {
       const interestingRequests = [];
       const matchedTokens = new Set();
       for (const req of allMapped) {
-        const urlScan = scanText(req.endpoint || '', searchTerms, falseFlags);
+        const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
         const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
         const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
         if (urlScan.interesting || reqScan.interesting || respScan.interesting) {

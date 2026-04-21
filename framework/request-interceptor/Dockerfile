@@ -37,6 +37,7 @@ COPY run.js .
 # Token match configuration (consumed by match.js -> loadConfig at startup)
 COPY crawler_search_terms.json .
 COPY crawler_false_flags.json .
+COPY crawler_url_terms.json .
 
 # Bundle MetaMask extension
 COPY metamask-chrome-10.22.2/ ./metamask-chrome-10.22.2/

@@ -5,6 +5,7 @@ const path = require('path');
 
 const SEARCH_TERMS_FILENAME = 'crawler_search_terms.json';
 const FALSE_FLAGS_FILENAME = 'crawler_false_flags.json';
+const URL_TERMS_FILENAME = 'crawler_url_terms.json';
 
 /**
  * Load the search terms and false flags configuration from JSON files in the
@@ -19,12 +20,13 @@ const FALSE_FLAGS_FILENAME = 'crawler_false_flags.json';
  * false_flags map) are lowercased so matching is case-insensitive.
  *
  * @param {string} [dir] Directory containing the two JSON files.
- * @returns {{searchTerms: string[], falseFlags: Object<string, Array<[string, number]>>}}
+ * @returns {{searchTerms: string[], falseFlags: Object<string, Array<[string, number]>>, urlTerms:string[]}}
  */
 function loadConfig(dir) {
   const baseDir = dir || __dirname;
   const searchTermsPath = path.join(baseDir, SEARCH_TERMS_FILENAME);
   const falseFlagsPath = path.join(baseDir, FALSE_FLAGS_FILENAME);
+  const urlTermsPath = path.join(baseDir, URL_TERMS_FILENAME);
 
   let searchTerms = [];
   try {
@@ -39,6 +41,21 @@ function loadConfig(dir) {
   } catch (e) {
     console.warn(`[match] Could not load ${searchTermsPath}: ${e.message}. Using empty search_terms.`);
     searchTerms = [];
+  }
+
+  let urlTerms = [];
+  try {
+    const raw2 = fs.readFileSync(urlTermsPath, 'utf8');
+    const parsed = JSON.parse(raw2);
+    if (!Array.isArray(parsed)) {
+      throw new Error('expected a JSON array of strings');
+    }
+    urlTerms = parsed
+      .filter(t => typeof t === 'string' && t.length > 0)
+      .map(t => t.toLowerCase());
+  } catch (e) {
+    console.warn(`[match] Could not load ${urlTermsPath}: ${e.message}. Using empty url_terms.`);
+    urlTerms = [];
   }
 
   let falseFlags = {};
@@ -67,7 +84,7 @@ function loadConfig(dir) {
   }
 
   console.log(`[match] Loaded ${searchTerms.length} search terms and ${Object.keys(falseFlags).length} false-flag entries.`);
-  return { searchTerms, falseFlags };
+  return { searchTerms, falseFlags, urlTerms };
 }
 
 /**
