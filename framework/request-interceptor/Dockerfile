@@ -31,6 +31,7 @@ RUN npm install --production
 COPY chrome/ ./chrome/
 COPY kafka-crawl.js .
 COPY match.js .
+COPY address-check.js .
 COPY mongodb.js .
 COPY run.js .
 
