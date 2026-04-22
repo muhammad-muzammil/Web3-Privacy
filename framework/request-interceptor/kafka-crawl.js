@@ -342,10 +342,11 @@ async function main() {
       // Step 4: scan captured requests for non-false-flagged token hits and
       // build the filtered additionalRequests array. Only requests where the
       // URL, request body, or response body contains an interesting token are
-      // kept.
+      // kept. Also search for the wallet strings and save them.
       const allMapped = mapRequests(crawlLog.requests || []);
       const interestingRequests = [];
       const matchedTokens = new Set();
+      const matchedAddresses = [];
       for (const req of allMapped) {
         const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
         const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
@@ -355,6 +356,9 @@ async function main() {
           urlScan.tokens.forEach(t => matchedTokens.add(t));
           reqScan.tokens.forEach(t => matchedTokens.add(t));
           respScan.tokens.forEach(t => matchedTokens.add(t));
+          urlScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+          reqScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+          respScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
         }
       }
 
@@ -386,6 +390,7 @@ async function main() {
             pageSrc,
             interestingRequests,
             interactions,
+            matchedAddresses, //the addresses
             1 // crawlerType = 1 (Puppeteer)
           );
         } catch (e) {

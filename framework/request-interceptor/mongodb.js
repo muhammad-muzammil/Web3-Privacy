@@ -45,7 +45,7 @@ async function initDb() {
  * @param {Array}  interactions - [{type, info}] pairs including wallet interaction data
  * @param {number} crawlerType - Crawler type flag (1 = Puppeteer)
  */
-async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageSrc = '', additionalRequests = [], interactions = [], crawlerType = 1) {
+async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageSrc = '', additionalRequests = [], interactions = [], matchedAddresses = [], crawlerType = 1) {
   if (!db) {
     throw new Error('Database not initialized. Call initDb first.');
   }
@@ -57,6 +57,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
     pageSrc,
     additionalRequests,
     interactions,
+    matchedAddresses,
     crawlerType
   };
 
@@ -73,6 +74,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
             pageSrc: { $ifNull: ['$pageSrc', pageSrc] },
             additionalRequests: { $ifNull: ['$additionalRequests', additionalRequests] },
             interactions: { $ifNull: ['$interactions', interactions] },
+            matchedAddresses: {$ifNull: ['$matchedAddresses', matchedAddresses]},
             // crawlerType: { $ifNull: ['$crawlerType', crawlerType] },
             followups: {
               $cond: {

@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { validateAddress } = require('./address-check');
 
 const SEARCH_TERMS_FILENAME = 'crawler_search_terms.json';
 const FALSE_FLAGS_FILENAME = 'crawler_false_flags.json';
@@ -87,6 +88,13 @@ function loadConfig(dir) {
   return { searchTerms, falseFlags, urlTerms };
 }
 
+
+const ethereumRegex = /(?<![a-zA-Z0-9])0x[a-fA-F0-9]{40}(?![a-fA-F0-9])/g
+const solanaRegex = /(?<![a-zA-Z0-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])/g
+const tronRegex = /(?<![a-zA-Z0-9])T[1-9A-HJ-NP-Za-km-z]{33}(?![1-9A-HJ-NP-Za-km-z])/g
+const cardanoShelleyRegex = /(?<![a-zA-Z0-9])addr1[a-z0-9]{50,99}(?![a-z0-9])/g
+const cardanoByronRegex = /(?<![a-zA-Z0-9])Ae2[a-km-zA-HJ-NP-Z1-9]{50,101}(?![a-km-zA-HJ-NP-Z1-9])/g
+
 /**
  * Scan a text blob for any search-term hit that is not eliminated by a
  * false flag. For each occurrence p of a token in the (lowercased) text, the
@@ -96,15 +104,43 @@ function loadConfig(dir) {
  * every occurrence of a token is discarded, the token is not interesting in
  * this text. If at least one occurrence survives, the token is added to the
  * returned set and `interesting` is true.
+ * Also scans for blockchain address strings:
+ * Ethereum (0x + 40 hex characters)
+ * Tron (T + 33 base58)
+ * Cardano addr1[a-z0-9]{50,} or Ae2[a-km-zA-HJ-NP-Z1-9]{50,}
+ * Solana [1-9A-HJ-NP-Za-km-z]{32,44}
+ * Searches using word boundaries to avoid false positives
  *
  * @param {string} text Text to scan (typically a request URL, body, or response body).
  * @param {string[]} searchTerms Lowercased list of tokens to look for.
  * @param {Object<string, Array<[string, number]>>} falseFlags Map of token -> [[refStr, offset], ...].
- * @returns {{interesting: boolean, tokens: Set<string>}}
+ * @returns {{interesting: boolean, tokens: Set<string>, addresses: Set<[string]>}}
  */
 function scanText(text, searchTerms, falseFlags) {
-  const result = { interesting: false, tokens: new Set() };
-  if (!text || typeof text !== 'string' || !searchTerms || searchTerms.length === 0) {
+  const result = { interesting: false, tokens: new Set(), addresses: new Set() };
+
+  if (!text || typeof text !== 'string') {
+    return result;
+  }
+
+  const addressPatterns = [
+    ['ethereum', ethereumRegex],
+    ['solana', solanaRegex],
+    ['tron', tronRegex],
+    ['cardano_legacy', cardanoByronRegex],
+    ['cardano', cardanoShelleyRegex]
+  ];
+  for (const [chain, regex] of addressPatterns) {
+    const matches = text.match(regex);
+    if (!matches) continue;
+    for (const m of matches) {
+      if (!validateAddress(chain, m)) continue;
+      result.addresses.add(`${chain}:${m}`);
+      result.interesting = true;
+    }
+  }
+
+  if (!searchTerms || searchTerms.length === 0) {
     return result;
   }
 
