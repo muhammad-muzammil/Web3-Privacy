@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { PublicKey } = require('@solana/web3.js');
 
 /**
  * Heuristic checksum validators for blockchain addresses extracted by regex.
@@ -48,8 +49,12 @@ function base58Decode(s) {
 // ---------- Solana ----------
 
 function validateSolana(addr) {
-  const bytes = base58Decode(addr);
-  return bytes !== null && bytes.length === 32;
+  try {
+    const pubkey = new PublicKey(addr);
+    return PublicKey.isOnCurve(pubkey.toBytes());
+  } catch {
+    return false;
+  }
 }
 
 // ---------- Tron ----------

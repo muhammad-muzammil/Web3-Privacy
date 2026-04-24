@@ -352,10 +352,14 @@ async function main() {
         const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
         const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
         if (urlScan.interesting || reqScan.interesting || respScan.interesting) {
-          interestingRequests.push(req);
-          urlScan.tokens.forEach(t => matchedTokens.add(t));
-          reqScan.tokens.forEach(t => matchedTokens.add(t));
-          respScan.tokens.forEach(t => matchedTokens.add(t));
+          const reqTokens = new Set();
+          urlScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+          reqScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+          respScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+          interestingRequests.push({
+            request: req,
+            matchedTokens: [...reqTokens]
+          });
           urlScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
           reqScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
           respScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
@@ -391,7 +395,7 @@ async function main() {
             interestingRequests,
             interactions,
             matchedAddresses, //the addresses
-            1 // crawlerType = 1 (Puppeteer)
+            1 // crawlerVersion — bump when making schema-affecting changes
           );
         } catch (e) {
           console.error(`Failed to insert crawls record for ${url}: ${e.message}`);

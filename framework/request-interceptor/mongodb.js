@@ -43,9 +43,13 @@ async function initDb() {
  * @param {string} pageSrc - Full HTML source
  * @param {Array}  additionalRequests - Mapped request array [{endpoint, method, status, requestBody, responseBody, type}]
  * @param {Array}  interactions - [{type, info}] pairs including wallet interaction data
- * @param {number} crawlerType - Crawler type flag (1 = Puppeteer)
+ * @param {Array}  matchedAddresses - Extracted blockchain address tuples [[chain, addr], ...]
+ * @param {number} crawlerVersion - Monotonic version of the crawler code that produced this record.
+ *                                  The top-level `crawlerVersion` field is overwritten on every
+ *                                  upsert so "latest run wins"; the per-run copy is also preserved
+ *                                  inside each `followups[]` entry.
  */
-async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageSrc = '', additionalRequests = [], interactions = [], matchedAddresses = [], crawlerType = 1) {
+async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageSrc = '', additionalRequests = [], interactions = [], matchedAddresses = [], crawlerVersion = 1) {
   if (!db) {
     throw new Error('Database not initialized. Call initDb first.');
   }
@@ -58,7 +62,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
     additionalRequests,
     interactions,
     matchedAddresses,
-    crawlerType
+    crawlerVersion
   };
 
   try {
@@ -75,7 +79,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
             additionalRequests: { $ifNull: ['$additionalRequests', additionalRequests] },
             interactions: { $ifNull: ['$interactions', interactions] },
             matchedAddresses: {$ifNull: ['$matchedAddresses', matchedAddresses]},
-            // crawlerType: { $ifNull: ['$crawlerType', crawlerType] },
+            crawlerVersion: crawlerVersion,
             followups: {
               $cond: {
                 if: { $isArray: '$followups' },

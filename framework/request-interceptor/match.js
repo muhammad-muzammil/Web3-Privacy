@@ -90,7 +90,7 @@ function loadConfig(dir) {
 
 
 const ethereumRegex = /(?<![a-zA-Z0-9])0x[a-fA-F0-9]{40}(?![a-fA-F0-9])/g
-const solanaRegex = /(?<![a-zA-Z0-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])/g
+const solanaRegex = /(?<![a-zA-Z0-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![a-zA-Z0-9])/g
 const tronRegex = /(?<![a-zA-Z0-9])T[1-9A-HJ-NP-Za-km-z]{33}(?![1-9A-HJ-NP-Za-km-z])/g
 const cardanoShelleyRegex = /(?<![a-zA-Z0-9])addr1[a-z0-9]{50,99}(?![a-z0-9])/g
 const cardanoByronRegex = /(?<![a-zA-Z0-9])Ae2[a-km-zA-HJ-NP-Z1-9]{50,101}(?![a-km-zA-HJ-NP-Z1-9])/g
@@ -125,7 +125,6 @@ function scanText(text, searchTerms, falseFlags) {
 
   const addressPatterns = [
     ['ethereum', ethereumRegex],
-    ['solana', solanaRegex],
     ['tron', tronRegex],
     ['cardano_legacy', cardanoByronRegex],
     ['cardano', cardanoShelleyRegex]
@@ -176,6 +175,19 @@ function scanText(text, searchTerms, falseFlags) {
     if (foundReal) {
       result.tokens.add(token);
       result.interesting = true;
+    }
+  }
+  //if interesting keywords were found, search for solana addresses
+  if (result.interesting){
+    const solMatches = text.match(solanaRegex);
+    if (!solMatches){
+      return result;
+    }
+    for (const m of solMatches) {
+      if (!validateAddress('solana', m)){
+        continue;
+      }
+      result.addresses.add(`solana:${m}`);
     }
   }
 
