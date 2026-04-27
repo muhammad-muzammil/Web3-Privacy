@@ -1,4 +1,6 @@
 [
+  "jsonrpc",
+  "eth_call",
   "web3.min.js",
   "new Web3(",
   "web3",
