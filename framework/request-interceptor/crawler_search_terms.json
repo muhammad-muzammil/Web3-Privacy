@@ -25,7 +25,6 @@
   "getContract(",
   "@parity/light.js",
   "defaultAccount().pipe(",
-  ".subscribe(",
   "useAccount(",
   "useConnect(",
   "useBalance(",
