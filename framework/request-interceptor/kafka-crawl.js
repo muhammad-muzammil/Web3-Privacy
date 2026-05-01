@@ -27,7 +27,7 @@ const METAMASK_PATH = process.env.METAMASK_PATH || './metamask-chrome-10.22.2';
 const CRAWL_TIMEOUT = parseInt(process.env.CRAWL_TIMEOUT || '30', 10) * 1000;
 const SITES_PER_SESSION = parseInt(process.env.SITES_PER_SESSION || '100', 10);
 const DEBUG_LEVEL = process.env.DEBUG_LEVEL || 'none';
-const MAX_CRAWL_RETRIES = 3;
+const MAX_CRAWL_RETRIES = 2;
 var session_dead = false;
 
 const logger = chromeLoggerLib.getLoggerForLevel(DEBUG_LEVEL);
@@ -242,184 +242,203 @@ async function main() {
   //Session compromised error message flag
   const SESSION_DEAD_RE = /Target closed|Session closed|Connection closed|Protocol error/;
   
-  await consumer.run({
-    autoCommit: false,
-    eachMessage: async ({ topic, partition, message, heartbeat }) => {
-      console.log(`recv p=${partition} off=${message.offset}`);
-      const commitOffset = () =>
-        consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
+  async function runConsumer() {
+    await consumer.run({
+      autoCommit: false,
+      eachMessage: async ({ topic, partition, message, heartbeat }) => {
+        console.log(`recv p=${partition} off=${message.offset}`);
+        const commitOffset = () =>
+          consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
 
-      // Session refresh: tear down the browser AND wipe its user-data-dir, then
-      // launch fresh. MetaMask will be re-imported on the new session.
-      if (siteCounter >= SITES_PER_SESSION || session_dead) {
-        logger.debug('Session refresh: restarting browser');
-        await destroySession(session);
-        session = await startBrowser();
-        siteCounter = 0;
-      }
-
-      const messageStr = message.value.toString();
-      const url = parseUrl(messageStr);
-
-      if (!url) {
-        await commitOffset();
-        return;
-      }
-
-      const accessedDate = new Date();
-
-      // Step 1: stamp the domains tracking collection BEFORE any browser work.
-      // Failure here is non-fatal — we still try to crawl.
-      try {
-        await upsertDomainTimestamp(url);
-      } catch (e) {
-        console.error(`Failed to upsert domains record for ${url}: ${e.message}`);
-      }
-
-      // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
-      // sel-wire.py:138-181 — three tries, then move on if still failing.
-      let crawlLog = null;
-      //sessionCompromised flag for when browser session fails
-      let sessionCompromised = false;
-      for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
-        await heartbeat();
-        try {
-          logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
-          const crawlPromise = crawlUrl(
-            session.browser,
-            session.requestLog,
-            session.cdpClients,
-            `https://${url}`,
-            { ...session.args, secs: 20},
-            logger,
-            true // skipImport — wallet already imported at session start
-          );
-          const result = await timeoutPromise(crawlPromise, CRAWL_TIMEOUT);
-
-          // timeoutPromise resolves to the literal `1` on timeout.
-          if (result === 1) {
-            logger.debug(`Timed out crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
-            continue;
-          }
-
-          crawlLog = result;
-          break;
-        } catch (e) {
-          const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
-          console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
-          if (SESSION_DEAD_RE.test(firstLine)) {
-            sessionCompromised = true;
-            break;  // no point retrying, browser is dead
-          } 
-        }
-      }
-
-      // Step 3: handle exhausted retries — commit offset and skip the rest.
-      // No publish to crawled-urls, no crawls write.
-      if (!crawlLog) {
-        console.error(`Giving up on ${url} after ${MAX_CRAWL_RETRIES} attempts`);
-        consecutiveFailures++;
-        siteCounter++;
-        if (sessionCompromised) {
-            console.error('Session compromised — rebuilding');
-            await destroySession(session);
-            session = await startBrowser();
-            siteCounter = 0;
-            consecutiveFailures = 0;
-        }
-        else if (consecutiveFailures >= 3) {
-          console.error('Rebuilding session after 3 consecutive failures');
+        // Session refresh: tear down the browser AND wipe its user-data-dir, then
+        // launch fresh. MetaMask will be re-imported on the new session.
+        if (siteCounter >= SITES_PER_SESSION || session_dead) {
+          logger.debug('Session refresh: restarting browser');
           await destroySession(session);
           session = await startBrowser();
+          siteCounter = 0;
+          session_dead = false;
           consecutiveFailures = 0;
         }
-        await commitOffset();
-        await heartbeat();
-        return;
-      }
-      consecutiveFailures = 0;
 
-      // Step 4: scan captured requests for non-false-flagged token hits and
-      // build the filtered additionalRequests array. Only requests where the
-      // URL, request body, or response body contains an interesting token are
-      // kept. Also search for the wallet strings and save them.
-      const allMapped = mapRequests(crawlLog.requests || []);
-      const interestingRequests = [];
-      const matchedTokens = new Set();
-      const matchedAddresses = [];
-      for (const req of allMapped) {
-        const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
-        const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
-        const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
-        if (urlScan.interesting || reqScan.interesting || respScan.interesting) {
-          const reqTokens = new Set();
-          urlScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
-          reqScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
-          respScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
-          interestingRequests.push({
-            request: req,
-            matchedTokens: [...reqTokens]
-          });
-          urlScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
-          reqScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
-          respScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+        const messageStr = message.value.toString();
+        const url = parseUrl(messageStr);
+
+        if (!url) {
+          await commitOffset();
+          return;
         }
-      }
 
-      // Step 5: detect any privacy interaction the wallet flow recorded.
-      const anyPrivacyInteraction = !!(
-        crawlLog.connected || crawlLog.signature_request || crawlLog.switch_network
-      );
+        const accessedDate = new Date();
 
-      const interesting = interestingRequests.length > 0 || anyPrivacyInteraction;
+        // Step 1: stamp the domains tracking collection BEFORE any browser work.
+        // Failure here is non-fatal — we still try to crawl.
+        try {
+          await upsertDomainTimestamp(url);
+        } catch (e) {
+          console.error(`Failed to upsert domains record for ${url}: ${e.message}`);
+        }
 
-      // Step 6: conditionally write the full record to the crawls collection.
-      if (interesting) {
-        const redirectedUrl = crawlLog.redirectedUrl || url;
-        const status = typeof crawlLog.status === 'number' ? crawlLog.status : -1;
-        const pageSrc = crawlLog.pageSrc || '';
-        const interactions = buildInteractions(crawlLog);
+        // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
+        // sel-wire.py:138-181 — three tries, then move on if still failing.
+        let crawlLog = null;
+        //sessionCompromised flag for when browser session fails
+        let sessionCompromised = false;
+        for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
+          await heartbeat();
+          try {
+            logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
+            const crawlPromise = crawlUrl(
+              session.browser,
+              session.requestLog,
+              session.cdpClients,
+              `https://${url}`,
+              { ...session.args, secs: 20},
+              logger,
+              true // skipImport — wallet already imported at session start
+            );
+            const result = await timeoutPromise(crawlPromise, CRAWL_TIMEOUT);
 
-        console.log(
-          `Interesting crawl for ${url}: ${interestingRequests.length} matching requests, ` +
-          `tokens={${Array.from(matchedTokens).join(',')}}, walletInteraction=${anyPrivacyInteraction}`
+            // timeoutPromise resolves to the literal `1` on timeout.
+            if (result === 1) {
+              logger.debug(`Timed out crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
+              continue;
+            }
+
+            crawlLog = result;
+            break;
+          } catch (e) {
+            const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
+            console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
+            if (SESSION_DEAD_RE.test(firstLine)) {
+              sessionCompromised = true;
+              break;  // no point retrying, browser is dead
+            } 
+          }
+        }
+
+        // Step 3: handle exhausted retries — commit offset and skip the rest.
+        // No publish to crawled-urls, no crawls write.
+        if (!crawlLog) {
+          console.error(`Giving up on ${url} after ${MAX_CRAWL_RETRIES} attempts`);
+          consecutiveFailures++;
+          siteCounter++;
+          if (sessionCompromised) {
+              console.error('Session compromised — rebuilding');
+              await destroySession(session);
+              session = await startBrowser();
+              siteCounter = 0;
+              consecutiveFailures = 0;
+          }
+          else if (consecutiveFailures >= 3) {
+            console.error('Rebuilding session after 3 consecutive failures');
+            await destroySession(session);
+            session = await startBrowser();
+            consecutiveFailures = 0;
+          }
+          await commitOffset();
+          await heartbeat();
+          return;
+        }
+        consecutiveFailures = 0;
+
+        // Step 4: scan captured requests for non-false-flagged token hits and
+        // build the filtered additionalRequests array. Only requests where the
+        // URL, request body, or response body contains an interesting token are
+        // kept. Also search for the wallet strings and save them.
+        const allMapped = mapRequests(crawlLog.requests || []);
+        const interestingRequests = [];
+        const matchedTokens = new Set();
+        const matchedAddresses = [];
+        for (const req of allMapped) {
+          const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
+          const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
+          const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
+          if (urlScan.interesting || reqScan.interesting || respScan.interesting) {
+            const reqTokens = new Set();
+            urlScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+            reqScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+            respScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+            interestingRequests.push({
+              request: req,
+              matchedTokens: [...reqTokens]
+            });
+            urlScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+            reqScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+            respScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+          }
+        }
+
+        // Step 5: detect any privacy interaction the wallet flow recorded.
+        const anyPrivacyInteraction = !!(
+          crawlLog.connected || crawlLog.signature_request || crawlLog.switch_network
         );
 
-        try {
-          await insertCrawlResult(
-            url,
-            redirectedUrl,
-            accessedDate,
-            status,
-            pageSrc,
-            interestingRequests,
-            interactions,
-            matchedAddresses, //the addresses
-            1 // crawlerVersion — bump when making schema-affecting changes
+        const interesting = interestingRequests.length > 0 || anyPrivacyInteraction;
+
+        // Step 6: conditionally write the full record to the crawls collection.
+        if (interesting) {
+          const redirectedUrl = crawlLog.redirectedUrl || url;
+          const status = typeof crawlLog.status === 'number' ? crawlLog.status : -1;
+          const pageSrc = crawlLog.pageSrc || '';
+          const interactions = buildInteractions(crawlLog);
+
+          console.log(
+            `Interesting crawl for ${url}: ${interestingRequests.length} matching requests, ` +
+            `tokens={${Array.from(matchedTokens).join(',')}}, walletInteraction=${anyPrivacyInteraction}`
           );
-        } catch (e) {
-          console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
+
+          try {
+            await insertCrawlResult(
+              url,
+              redirectedUrl,
+              accessedDate,
+              status,
+              pageSrc,
+              interestingRequests,
+              interactions,
+              matchedAddresses, //the addresses
+              1 // crawlerVersion — bump when making schema-affecting changes
+            );
+          } catch (e) {
+            console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
+          }
+        } else {
+          logger.debug(`Skipping crawls insert for ${url} (no interesting tokens or interactions)`);
         }
-      } else {
-        logger.debug(`Skipping crawls insert for ${url} (no interesting tokens or interactions)`);
-      }
 
-      // Step 7: always publish to crawled-urls on a successful crawl, then
-      // commit the Kafka offset.
-      try {
-        await producer.send({
-          topic: INDEX_TOPIC,
-          messages: [{ value: url }]
-        });
-      } catch (e) {
-        console.error(`Failed to produce to ${INDEX_TOPIC} for ${url}: ${e.message}`);
-      }
+        // Step 7: always publish to crawled-urls on a successful crawl, then
+        // commit the Kafka offset.
+        try {
+          await producer.send({
+            topic: INDEX_TOPIC,
+            messages: [{ value: url }]
+          });
+        } catch (e) {
+          console.error(`Failed to produce to ${INDEX_TOPIC} for ${url}: ${e.message}`);
+        }
 
-      await commitOffset();
-      await heartbeat();
-      siteCounter++;
+        await commitOffset();
+        await heartbeat();
+        siteCounter++;
+      }
+    });
+  }
+
+  consumer.on(consumer.events.CRASH, async (event) => {
+    console.error('Consumer crashed, restarting in 5s:', event.payload.error.message);
+    await sleep(5000);
+    try {
+      await consumer.connect();
+      await runConsumer();
+    } catch (e) {
+      console.error('Consumer failed to restart, exiting:', e.message);
+      process.exit(1);
     }
   });
+
+  await runConsumer();
+  
 }
 
 main().catch(e => {
