@@ -419,7 +419,7 @@ async function importMetaMaskWallet(logger, page) {
       const sign_button = await popup.waitForXPath('//*[@id="app-content"]/div/div[2]/div/div[3]/button[2]');
       await popup.evaluate($submit => $submit.click(), sign_button);
       logger.debug('Clicked on sign button!');
-
+      signature_request = true;
     } catch {}
     let switch_network = false;
     try {
@@ -428,6 +428,7 @@ async function importMetaMaskWallet(logger, page) {
       const switch_button = await popup.waitForXPath(`//*[text()="Switch network"]`, {timeout: 200});
       await switch_button.click();
       logger.debug('Clicked on approve and switch network button!');
+      switch_network = true;
     } catch {}
 
     if ((!signature_request) && (!switch_network)) {

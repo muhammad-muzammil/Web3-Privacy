@@ -17,6 +17,7 @@ const {
   buildInteractions
 } = require('./mongodb.js');
 const { loadConfig, scanText } = require('./match.js');
+const metrics = require('./metrics.js');
 
 // Configuration from environment
 const KAFKA_BROKER = process.env.KAFKA_BROKER;
@@ -269,6 +270,8 @@ async function main() {
           return;
         }
 
+        metrics.urlsConsumed.inc();
+
         const accessedDate = new Date();
 
         // Step 1: stamp the domains tracking collection BEFORE any browser work.
@@ -398,8 +401,9 @@ async function main() {
               interestingRequests,
               interactions,
               matchedAddresses, //the addresses
-              1 // crawlerVersion — bump when making schema-affecting changes
+              2 // crawlerVersion — bump when making schema-affecting changes
             );
+            metrics.crawlInserts.inc();
           } catch (e) {
             console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
           }

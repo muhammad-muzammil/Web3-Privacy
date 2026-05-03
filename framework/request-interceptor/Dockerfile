@@ -31,6 +31,7 @@ RUN npm install --production
 COPY chrome/ ./chrome/
 COPY kafka-crawl.js .
 COPY match.js .
+COPY metrics.js .
 COPY address-check.js .
 COPY mongodb.js .
 COPY run.js .
@@ -46,6 +47,8 @@ COPY metamask-chrome-10.22.2/ ./metamask-chrome-10.22.2/
 ENV TZ=America/New_York
 ENV DISPLAY=:99
 ENV METAMASK_PATH=./metamask-chrome-10.22.2
+
+EXPOSE 9090
 
 # Start xvfb (needed for extensions) then run the crawler
 CMD ["sh", "-c", "Xvfb :99 -screen 0 1920x1080x24 & node kafka-crawl.js"]
