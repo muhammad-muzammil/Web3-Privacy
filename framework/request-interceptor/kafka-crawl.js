@@ -28,7 +28,7 @@ const METAMASK_PATH = process.env.METAMASK_PATH || './metamask-chrome-10.22.2';
 const CRAWL_TIMEOUT = parseInt(process.env.CRAWL_TIMEOUT || '30', 10) * 1000;
 const SITES_PER_SESSION = parseInt(process.env.SITES_PER_SESSION || '100', 10);
 const DEBUG_LEVEL = process.env.DEBUG_LEVEL || 'none';
-const MAX_CRAWL_RETRIES = 2;
+const MAX_CRAWL_RETRIES = 1;
 var session_dead = false;
 
 const logger = chromeLoggerLib.getLoggerForLevel(DEBUG_LEVEL);
@@ -226,6 +226,7 @@ async function main() {
     maxWaitTimeInMs: 10000,
     sessionTimeout: 120000,
     heartbeatInterval: 10000,
+    rebalanceTimeout:300000,
     maxPollIntervalMs: 900000
   });
 
@@ -313,6 +314,7 @@ async function main() {
           } catch (e) {
             const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
             console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
+            break;
             if (SESSION_DEAD_RE.test(firstLine)) {
               sessionCompromised = true;
               break;  // no point retrying, browser is dead
@@ -339,7 +341,11 @@ async function main() {
             session = await startBrowser();
             consecutiveFailures = 0;
           }
-          await commitOffset();
+          try {
+            await commitOffset();
+          } catch (e) {
+            console.error(`commit failed for ${url} (likely rebalance in progress, will be redelivered): ${e.message}`);
+          }
           await heartbeat();
           return;
         }
@@ -422,7 +428,11 @@ async function main() {
           console.error(`Failed to produce to ${INDEX_TOPIC} for ${url}: ${e.message}`);
         }
 
-        await commitOffset();
+        try {
+          await commitOffset();
+        } catch (e) {
+          console.error(`commit failed for ${url} (likely rebalance in progress, will be redelivered): ${e.message}`);
+        }
         await heartbeat();
         siteCounter++;
       }
