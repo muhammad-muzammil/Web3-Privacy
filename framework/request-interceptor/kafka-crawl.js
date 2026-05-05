@@ -224,7 +224,7 @@ async function main() {
   const consumer = kafka.consumer({
     groupId: KAFKA_GROUP,
     maxWaitTimeInMs: 10000,
-    sessionTimeout: 120000,
+    sessionTimeout: 300000,
     heartbeatInterval: 10000,
     rebalanceTimeout:300000,
     maxPollIntervalMs: 900000
@@ -252,6 +252,14 @@ async function main() {
         const commitOffset = () =>
           consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
 
+        // Background heartbeat — kafkajs does not auto-heartbeat during eachMessage,
+        // so a long crawl (esp. MetaMask "wallet connect hard timeout") would
+        // otherwise let the broker session expire and trigger a rebalance.
+        const heartbeatTicker = setInterval(() => {
+          heartbeat().catch(e => console.error(`background heartbeat failed: ${e.message}`));
+        }, 30000);
+
+        try {
         // Session refresh: tear down the browser AND wipe its user-data-dir, then
         // launch fresh. MetaMask will be re-imported on the new session.
         if (siteCounter >= SITES_PER_SESSION || session_dead) {
@@ -435,6 +443,9 @@ async function main() {
         }
         await heartbeat();
         siteCounter++;
+        } finally {
+          clearInterval(heartbeatTicker);
+        }
       }
     });
   }
