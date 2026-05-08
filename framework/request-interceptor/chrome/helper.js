@@ -19,9 +19,10 @@ const waitForNavigation = async (page, maxWaitTimeInMillisecs) => {
   }
 
 async function importMetaMaskWallet(logger, page) {
-    logger.debug('\033[94mTrying to import MetaMask connect...\033[0m');
+    console.log('\x1b[94mTrying to import MetaMask connect...\x1b[0m');
 
-    const credentials = JSON.parse(fs.readFileSync('metamask_credentials.json'));
+    const credPath = process.env.METAMASK_CREDENTIALS || 'metamask_credentials.json';
+    const credentials = JSON.parse(fs.readFileSync(credPath));
 
     // Click get started button
     const get_started_button = await page.waitForXPath('//*[@id="app-content"]/div/div[2]/div/div/div/button');
@@ -59,7 +60,7 @@ async function importMetaMaskWallet(logger, page) {
     const all_done_button = await page.waitForXPath('//*[@id="app-content"]/div/div[2]/div/div/button');
     await page.evaluate($submit => $submit.click(), all_done_button);
 
-    logger.debug('\033[92mImporting MetaMask wallet was successful!\033[0m');
+    console.log('\x1b[92mImporting MetaMask wallet was successful!\x1b[0m');
  }
 
  async function connectMetaMaskWallet(logger, page, browser, args) {
@@ -418,7 +419,7 @@ async function importMetaMaskWallet(logger, page) {
       const sign_button = await popup.waitForXPath('//*[@id="app-content"]/div/div[2]/div/div[3]/button[2]');
       await popup.evaluate($submit => $submit.click(), sign_button);
       logger.debug('Clicked on sign button!');
-
+      signature_request = true;
     } catch {}
     let switch_network = false;
     try {
@@ -427,6 +428,7 @@ async function importMetaMaskWallet(logger, page) {
       const switch_button = await popup.waitForXPath(`//*[text()="Switch network"]`, {timeout: 200});
       await switch_button.click();
       logger.debug('Clicked on approve and switch network button!');
+      switch_network = true;
     } catch {}
 
     if ((!signature_request) && (!switch_network)) {
