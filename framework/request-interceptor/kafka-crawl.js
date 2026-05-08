@@ -91,7 +91,7 @@ async function startBrowser() {
   const browser = await chromePuppeteerLib.launch(args);
 
   // Set up the targetcreated handler for network capture
-  const requestLog = { requests: [] };
+  const requestLog = { requests: [], evalScripts: [] };
   const cdpClients = [];
   const webSockets = [];
 
@@ -143,6 +143,17 @@ async function startBrowser() {
     const cdpClient = await page.target().createCDPSession();
     await cdpClient.send('Network.enable');
     await cdpClient.send('Page.enable');
+    await cdpClient.send('Debugger.enable');
+
+    cdpClient.on('Debugger.scriptParsed', async (params) => {
+      if (params.url) return; // scripts with a URL are captured by the network handler
+      try {
+        const { scriptSource } = await cdpClient.send('Debugger.getScriptSource', { scriptId: params.scriptId });
+        if (scriptSource) {
+          requestLog.evalScripts.push({ source: scriptSource });
+        }
+      } catch (e) {}
+    });
 
     cdpClient.on('Network.responseReceived', async (event) => {
       for (let i = 0; i < requestLog.requests.length; i++) {
@@ -414,7 +425,8 @@ async function main() {
               pageSrc,
               interestingRequests,
               interactions,
-              matchedAddresses, //the addresses
+              matchedAddresses,
+              interestingRequests.length > 0 ? (crawlLog.evalScripts || []) : [],
               2 // crawlerVersion — bump when making schema-affecting changes
             );
             metrics.crawlInserts.inc();

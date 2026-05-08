@@ -49,7 +49,7 @@ async function initDb() {
  *                                  upsert so "latest run wins"; the per-run copy is also preserved
  *                                  inside each `followups[]` entry.
  */
-async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageSrc = '', additionalRequests = [], interactions = [], matchedAddresses = [], crawlerVersion = 1) {
+async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageSrc = '', additionalRequests = [], interactions = [], matchedAddresses = [], evalScripts = [], crawlerVersion = 1) {
   if (!db) {
     throw new Error('Database not initialized. Call initDb first.');
   }
@@ -62,6 +62,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
     additionalRequests,
     interactions,
     matchedAddresses,
+    evalScripts,
     crawlerVersion
   };
 
@@ -79,6 +80,7 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
             additionalRequests: { $ifNull: ['$additionalRequests', additionalRequests] },
             interactions: { $ifNull: ['$interactions', interactions] },
             matchedAddresses: {$ifNull: ['$matchedAddresses', matchedAddresses]},
+            evalScripts: { $ifNull: ['$evalScripts', evalScripts] },
             crawlerVersion: crawlerVersion,
             followups: {
               $cond: {

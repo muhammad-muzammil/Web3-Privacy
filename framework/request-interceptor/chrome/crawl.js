@@ -199,6 +199,7 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
 
   // Clear request log for this crawl
   const requestsBefore = requestLog.requests.length
+  const evalScriptsBefore = requestLog.evalScripts ? requestLog.evalScripts.length : 0
 
   const page = await browser.newPage()
 
@@ -315,8 +316,9 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
     log.redirectedUrl = page.url()
   } catch (e) {}
 
-  // Collect requests captured during this crawl
+  // Collect requests and eval'd scripts captured during this crawl
   log.requests = requestLog.requests.slice(requestsBefore)
+  log.evalScripts = requestLog.evalScripts ? requestLog.evalScripts.slice(evalScriptsBefore) : []
 
   // Save all cookies
   log.cookies = []
