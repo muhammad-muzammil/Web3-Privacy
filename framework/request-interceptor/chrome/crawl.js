@@ -221,7 +221,7 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
   }
 
   logger.debug(`Visiting ${url}`)
-  await page.goto(url, {waitUntil: "domcontentloaded", timeout: 25000})
+  await page.goto(url, {waitUntil: "domcontentloaded", timeout: 2000})
   await page.bringToFront()
 
   const client = await page.target().createCDPSession();
@@ -246,16 +246,15 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
 
   // Connect to DApp
   try {
-    page.setDefaultNavigationTimeout(30000)
-    page.setDefaultTimeout(15000)
+    let result;
     try {
-      let result = await Promise.race([
+      result = await Promise.race([
         connectMetaMaskWallet(logger, page, browser),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('wallet connect hard timeout')), 40000))
+        new Promise((_, rej) => setTimeout(() => rej(new Error('wallet connect hard timeout')), 3000))
       ]);
     } catch (err) {
       if (/wallet connect hard timeout/.test(err.message)) {
-        try { 
+        try {
           await page.close({ runBeforeUnload: false });
         } catch {}
       }
@@ -511,16 +510,6 @@ const crawl = async args => {
   return log
 }
 
-const timeoutPromise = async (promise, ms) => {
-  let timeout = new Promise(function(resolve, reject) {
-      setTimeout(resolve, ms, 1);
-  });
-  let result = Promise.race([promise, timeout]).then(function(value) {
-      return value;
-  });
-  return result;
-}
-
 const click = async (elHandle, loginRegisterLinkAttrs, method = "method1", page) => {
   try {
       if (method === NATIVE_CLICK) {
@@ -538,6 +527,5 @@ const click = async (elHandle, loginRegisterLinkAttrs, method = "method1", page)
 
 module.exports = {
   crawl,
-  crawlUrl,
-  timeoutPromise
+  crawlUrl
 }

@@ -19,6 +19,21 @@ const crawlInserts = new client.Counter({
   help: 'Total successful inserts into the MongoDB crawls collection by this crawler instance.'
 });
 
+const crawlsCompleted = new client.Counter({
+  name: 'wallet_crawler_crawls_completed_total',
+  help: 'Crawls where the retry loop produced a non-null result (denominator for outcome ratios).'
+});
+
+const walletInteractions = new client.Counter({
+  name: 'wallet_crawler_wallet_interactions_total',
+  help: 'Crawls where the dApp invoked the wallet (connect, signature_request, or switch_network).'
+});
+
+const filterPassedRequests = new client.Counter({
+  name: 'wallet_crawler_filter_passed_requests_total',
+  help: 'Crawls where at least one captured request passed the search-term/false-flag filter.'
+});
+
 const port = parseInt(process.env.METRICS_PORT || '9090', 10);
 
 const server = http.createServer(async (req, res) => {
@@ -45,4 +60,4 @@ server.on('error', (e) => {
   console.error(`Metrics server error: ${e.message}`);
 });
 
-module.exports = { urlsConsumed, crawlInserts };
+module.exports = { urlsConsumed, crawlInserts, crawlsCompleted, walletInteractions, filterPassedRequests };
