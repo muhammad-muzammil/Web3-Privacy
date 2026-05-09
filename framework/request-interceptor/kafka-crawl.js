@@ -41,7 +41,24 @@ const logger = chromeLoggerLib.getLoggerForLevel(DEBUG_LEVEL);
 
 // Load search_terms / false_flags once at startup. Both files live next to
 // this script (resolved by match.js via __dirname).
-const { searchTerms, falseFlags, urlTerms } = loadConfig();
+const { searchTerms, falseFlags, urlTerms, safeEndpointDomains, safeRedirectDomains } = loadConfig();
+
+
+/*****
+ * Scans a URL domain for whether it is from a known safe domain or not. Used to check for 
+ * and quickly drop irrelevant redirects to google or other sites.
+ */
+isSafeRedirectDomain = (url) => {
+  try {
+    const host = new URL(url.startsWith('http') ? url : `https://${url}`).hostname;
+    return safeRedirectDomains.some(safe => host === safe || host.endsWith('.' + safe));
+  } catch { return false; }
+};
+
+/* Scans the URL of outgoing network requests for safe domains */
+const isSafeEndpoint = (url) => safeEndpointDomains.some(
+    safe => { try { return new URL(url).hostname.endsWith(safe); } catch { return false; } }
+  );
 
 /**
  * Parse URL from Certificate Transparency stream message.
@@ -458,6 +475,17 @@ async function main() {
         metrics.crawlsCompleted.inc();
         consecutiveFailures = 0;
 
+        /* Drop the log and consume if it redirected to a known safe domain */
+        if (crawlLog.redirectedUrl && isSafeRedirectDomain(crawlLog.redirectedUrl)) {
+          logger.debug(`Skipping ${url} — redirected to safe domain: ${crawlLog.redirectedUrl}`);
+          metrics.crawlsCompleted.inc();
+          consecutiveFailures = 0;
+          siteCounter++;
+          try { await commitOffset(); } catch (e) { /* ... */ }
+          await heartbeat();
+          return;
+        }
+
         // Steps 4-7: analysis (request scanning, MongoDB insert, Kafka publish,
         // offset commit). Wrapped in ANALYSIS_TIMEOUT so a stalled DB or broker
         // cannot wedge the consumer loop. On timeout we still try to commit the
@@ -490,7 +518,10 @@ async function main() {
           const interestingRequests = [];
           const matchedTokens = new Set();
           const matchedAddresses = [];
+
           for (const req of allMapped) {
+            //skip request if it's made to a known safe endpoint
+            if (isSafeEndpoint(req.endpoint || '')) continue; 
             const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
             const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
             const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);

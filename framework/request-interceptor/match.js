@@ -7,6 +7,8 @@ const { validateAddress } = require('./address-check');
 const SEARCH_TERMS_FILENAME = 'crawler_search_terms.json';
 const FALSE_FLAGS_FILENAME = 'crawler_false_flags.json';
 const URL_TERMS_FILENAME = 'crawler_url_terms.json';
+const SAFE_ENDPOINT_DOMAINS_FILE = 'safe_endpoint_domains.json';
+const SAFE_REDIRECT_DOMAINS_FILE = 'safe_redirect_domains.json';
 
 /**
  * Load the search terms and false flags configuration from JSON files in the
@@ -28,6 +30,8 @@ function loadConfig(dir) {
   const searchTermsPath = path.join(baseDir, SEARCH_TERMS_FILENAME);
   const falseFlagsPath = path.join(baseDir, FALSE_FLAGS_FILENAME);
   const urlTermsPath = path.join(baseDir, URL_TERMS_FILENAME);
+  const endpointsPath = path.join(baseDir, SAFE_ENDPOINT_DOMAINS_FILE);
+  const redirectsPath = path.join(baseDir, SAFE_REDIRECT_DOMAINS_FILE);
 
   let searchTerms = [];
   try {
@@ -59,7 +63,7 @@ function loadConfig(dir) {
     urlTerms = [];
   }
 
-  let falseFlags = {};
+  let falseFlags = [];
   try {
     const raw = fs.readFileSync(falseFlagsPath, 'utf8');
     const parsed = JSON.parse(raw);
@@ -84,8 +88,38 @@ function loadConfig(dir) {
     falseFlags = {};
   }
 
+  let safeEndpointDomains = [];
+  try {
+    const raw2 = fs.readFileSync(endpointsPath, 'utf8');
+    const parsed = JSON.parse(raw2);
+    if (!Array.isArray(parsed)) {
+      throw new Error('expected a JSON array of strings');
+    }
+    urlTerms = parsed
+      .filter(t => typeof t === 'string' && t.length > 0)
+      .map(t => t.toLowerCase());
+  } catch (e) {
+    console.warn(`[match] Could not load ${endpointsPath}: ${e.message}. Using empty safeEndpointDomains.`);
+    urlTerms = [];
+  }
+
+  let safeRedirectDomains = [];
+  try {
+    const raw2 = fs.readFileSync(redirectsPath, 'utf8');
+    const parsed = JSON.parse(raw2);
+    if (!Array.isArray(parsed)) {
+      throw new Error('expected a JSON array of strings');
+    }
+    urlTerms = parsed
+      .filter(t => typeof t === 'string' && t.length > 0)
+      .map(t => t.toLowerCase());
+  } catch (e) {
+    console.warn(`[match] Could not load ${redirectsPath}: ${e.message}. Using empty safeRedirectDomains.`);
+    urlTerms = [];
+  }
+
   console.log(`[match] Loaded ${searchTerms.length} search terms and ${Object.keys(falseFlags).length} false-flag entries.`);
-  return { searchTerms, falseFlags, urlTerms };
+  return { searchTerms, falseFlags, urlTerms, safeEndpointDomains, safeRedirectDomains };
 }
 
 

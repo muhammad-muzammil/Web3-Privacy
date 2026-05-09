@@ -313,7 +313,9 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
   try {
     log.pageSrc = await page.content()
     log.redirectedUrl = page.url()
-  } catch (e) {}
+  } catch (e) {
+    
+  }
 
   // Collect requests and eval'd scripts captured during this crawl
   log.requests = requestLog.requests.slice(requestsBefore)
