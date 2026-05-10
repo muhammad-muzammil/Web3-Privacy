@@ -203,11 +203,10 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
 
   const page = await browser.newPage()
 
-  // Wait for wallet page to load
-  await sleep(2)
-  let pages = await browser.pages()
-
   if (!skipImport) {
+    // Wait for MetaMask's first-run welcome tab to materialize.
+    await sleep(2)
+    const pages = await browser.pages()
     const wallet = await pages[pages.length - 1]
     await wallet.bringToFront();
 
@@ -244,38 +243,30 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
     }
   }
 
-  // Connect to DApp
-  try {
-    let result;
-    try {
-      result = await Promise.race([
-        connectMetaMaskWallet(logger, page, browser),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('wallet connect hard timeout')), 3000))
-      ]);
-    } catch (err) {
-      if (/wallet connect hard timeout/.test(err.message)) {
-        try {
-          await page.close({ runBeforeUnload: false });
-        } catch {}
-      }
-      throw err;
-    }
-    log.connected         = result[0];
-    log.connect_label     = result[1];
-    log.metamask_label    = result[2];
-    log.checkbox_clicked  = result[3];
-    log.signature_request = result[4];
-    log.switch_network    = result[5];
-  } catch (error) {
-    logger.debug('\x1b[91mFailed to connect to '+url+'!\x1b[0m')
-    console.log(error);
-  }
+  // Connect to DApp. Soft race: at the 8s mark we move on to the dwell phase,
+  // but `connectMetaMaskWallet` keeps running in the background — its in-flight
+  // button clicks and popup detection continue to fire network requests we want
+  // to capture, and if the full flow finishes during dwell we still record the
+  // resulting flags. The page is NOT closed on race expiry, so dwell-window
+  // requests/cookies/pageSrc are preserved.
+  let walletDone = false;
+  let walletResult = null;
+  const walletPromise = connectMetaMaskWallet(logger, page, browser)
+    .then(r => { walletDone = true; walletResult = r; })
+    .catch(err => {
+      logger.debug('\x1b[91mWallet connect rejected for '+url+': '+(err && err.message ? err.message : err)+'\x1b[0m');
+    });
+
+  await Promise.race([
+    walletPromise,
+    new Promise(resolve => setTimeout(resolve, 8000))
+  ]);
 
   if (args.links === undefined) {
     // Wait a certain time and do nothing
     const waitTimeMs = (args.secs || 10) * 1000
     logger.debug(`Waiting for ${waitTimeMs}ms`)
-    await page.waitForTimeout(waitTimeMs)
+    try { await page.waitForTimeout(waitTimeMs) } catch {}
   } else {
     // Interact with DApp
     let counter = 0;
@@ -309,12 +300,25 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
     }
   }
 
+  // If the wallet flow completed at any point up to now (during the 8s race
+  // or somewhere inside the dwell window), capture its flags. Otherwise the
+  // promise is still pending and will reject when the page closes below; that
+  // rejection is swallowed by the .catch attached at the call site.
+  if (walletDone && walletResult) {
+    log.connected         = walletResult[0];
+    log.connect_label     = walletResult[1];
+    log.metamask_label    = walletResult[2];
+    log.checkbox_clicked  = walletResult[3];
+    log.signature_request = walletResult[4];
+    log.switch_network    = walletResult[5];
+  }
+
   // Update page source after wallet interaction and dwell time
   try {
     log.pageSrc = await page.content()
     log.redirectedUrl = page.url()
   } catch (e) {
-    
+
   }
 
   // Collect requests and eval'd scripts captured during this crawl

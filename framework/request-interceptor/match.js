@@ -95,12 +95,12 @@ function loadConfig(dir) {
     if (!Array.isArray(parsed)) {
       throw new Error('expected a JSON array of strings');
     }
-    urlTerms = parsed
+    safeEndpointDomains = parsed
       .filter(t => typeof t === 'string' && t.length > 0)
       .map(t => t.toLowerCase());
   } catch (e) {
     console.warn(`[match] Could not load ${endpointsPath}: ${e.message}. Using empty safeEndpointDomains.`);
-    urlTerms = [];
+    safeEndpointDomains = [];
   }
 
   let safeRedirectDomains = [];
@@ -110,15 +110,17 @@ function loadConfig(dir) {
     if (!Array.isArray(parsed)) {
       throw new Error('expected a JSON array of strings');
     }
-    urlTerms = parsed
+    safeRedirectDomains = parsed
       .filter(t => typeof t === 'string' && t.length > 0)
       .map(t => t.toLowerCase());
   } catch (e) {
     console.warn(`[match] Could not load ${redirectsPath}: ${e.message}. Using empty safeRedirectDomains.`);
-    urlTerms = [];
+    safeRedirectDomains = [];
   }
 
-  console.log(`[match] Loaded ${searchTerms.length} search terms and ${Object.keys(falseFlags).length} false-flag entries.`);
+  console.log(`[match] Loaded ${searchTerms.length} search terms, ${urlTerms.length} url terms, ` +
+              `${safeEndpointDomains.length} safe endpoints, ${safeRedirectDomains.length} safe redirects, ` +
+              `${Object.keys(falseFlags).length} false-flag entries.`);
   return { searchTerms, falseFlags, urlTerms, safeEndpointDomains, safeRedirectDomains };
 }
 

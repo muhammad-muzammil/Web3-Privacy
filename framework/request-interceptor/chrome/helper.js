@@ -12,9 +12,7 @@ const waitForNavigation = async (page, maxWaitTimeInMillisecs) => {
         maxWaitTimeInMillisecs = POST_CLICK_LOAD_TIMEOUT;
     }
     try {
-        const clickLoadTimer = createTimer();
         await page.waitForNavigation({ 'timeout': maxWaitTimeInMillisecs, 'waitUntil': 'load' });
-        await page.waitForTimeout(maxWaitTimeInMillisecs);
     } catch {}
   }
 

@@ -28,7 +28,7 @@ const METAMASK_PATH = process.env.METAMASK_PATH || './metamask-chrome-10.22.2';
 // Page interaction (goto + wallet connect + dwell + collection): hard wall-clock
 // after which the active page is forcibly closed and analysis runs on whatever
 // requests/evalScripts the event handlers captured up to that point.
-const PAGE_TIMEOUT = parseInt(process.env.PAGE_TIMEOUT || '10', 10) * 1000;
+const PAGE_TIMEOUT = parseInt(process.env.PAGE_TIMEOUT || '18', 10) * 1000;
 // Analysis (request scanning, MongoDB insert, Kafka publish) gets its own,
 // shorter budget so a stalled DB or broker cannot wedge the consumer loop.
 const ANALYSIS_TIMEOUT = parseInt(process.env.ANALYSIS_TIMEOUT || '5', 10) * 1000;
@@ -364,6 +364,7 @@ async function main() {
   let siteCounter = 0;
   let session = await startBrowser();
 
+  console.log(`Crawler config: PAGE_TIMEOUT=${PAGE_TIMEOUT}ms, ANALYSIS_TIMEOUT=${ANALYSIS_TIMEOUT}ms, SITES_PER_SESSION=${SITES_PER_SESSION}`);
   console.log(`Kafka consumer started. Group: ${KAFKA_GROUP}, Topic: ${KAFKA_TOPIC}`);
   //Session compromised error message flag
   const SESSION_DEAD_RE = /Target closed|Session closed|Connection closed|Protocol error/;
@@ -430,7 +431,7 @@ async function main() {
             crawlLog = await crawlUrlBounded(
               session,
               `https://${url}`,
-              { ...session.args, secs: 2 },
+              { ...session.args, secs: 5 },
               logger,
               PAGE_TIMEOUT
             );

@@ -40,6 +40,8 @@ COPY run.js .
 COPY crawler_search_terms.json .
 COPY crawler_false_flags.json .
 COPY crawler_url_terms.json .
+COPY safe_endpoint_domains.json .
+COPY safe_redirect_domains.json .
 
 # Bundle MetaMask extension
 COPY metamask-chrome-10.22.2/ ./metamask-chrome-10.22.2/
