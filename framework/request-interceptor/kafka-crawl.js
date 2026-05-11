@@ -4,7 +4,7 @@ require('dotenv').config();
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { Kafka } = require('kafkajs');
+const Kafka = require('node-rdkafka');
 const chromePuppeteerLib = require('./chrome/puppeteer.js');
 const chromeLoggerLib = require('./chrome/logging.js');
 const { crawlUrl } = require('./chrome/crawl.js');
@@ -339,329 +339,396 @@ async function main() {
     process.exit(1);
   }
 
-  // Initialize Kafka
-  const kafka = new Kafka({
-    clientId: 'wallet-crawler',
-    brokers: [KAFKA_BROKER]
+  // Initialize Kafka (node-rdkafka). librdkafka drives heartbeats from a
+  // background C thread, so a busy Node event loop (Puppeteer pegs CPU during
+  // crawls) cannot starve them. group.instance.id enables static membership:
+  // routine restarts hold their partition assignment for session.timeout.ms
+  // instead of triggering a group-wide rebalance. cooperative-sticky only
+  // moves the affected partitions when a rebalance does happen.
+  const INSTANCE_ID = process.env.INSTANCE_ID || '0';
+  const HOST_IP = process.env.HOST_IP || os.hostname();
+  const GROUP_INSTANCE_ID = process.env.KAFKA_GROUP_INSTANCE_ID || `${HOST_IP}-${INSTANCE_ID}`;
+  const SESSION_TIMEOUT_MS = parseInt(process.env.KAFKA_SESSION_TIMEOUT_MS || '60000', 10);
+  const MAX_POLL_INTERVAL_MS = parseInt(process.env.KAFKA_MAX_POLL_INTERVAL_MS || '300000', 10);
+
+  function handleRebalance(err, assignment) {
+    if (err.code === Kafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS) {
+      try { consumer.incrementalAssign(assignment); }
+      catch (e) { console.error(`incrementalAssign threw: ${e.message}`); }
+    } else if (err.code === Kafka.CODES.ERRORS.ERR__REVOKE_PARTITIONS) {
+      // Flush stored offsets BEFORE giving up the partitions. commitMessage()
+      // calls only queue offsets for the background commit thread, so without
+      // this the next owner can replay any messages whose commit hadn't
+      // landed at the broker yet.
+      try { consumer.commit(); }
+      catch (e) { console.error(`commit on revoke threw: ${e.message}`); }
+      try { consumer.incrementalUnassign(assignment); }
+      catch (e) { console.error(`incrementalUnassign threw: ${e.message}`); }
+    } else {
+      console.error(`rebalance event with unexpected code ${err.code}: ${err.message}`);
+    }
+  }
+
+  const consumer = new Kafka.KafkaConsumer({
+    'metadata.broker.list': KAFKA_BROKER,
+    'group.id': KAFKA_GROUP,
+    'group.instance.id': GROUP_INSTANCE_ID,
+    'client.id': `wallet-crawler-${GROUP_INSTANCE_ID}`,
+    'partition.assignment.strategy': 'cooperative-sticky',
+    'session.timeout.ms': SESSION_TIMEOUT_MS,
+    'heartbeat.interval.ms': 20000,
+    'max.poll.interval.ms': MAX_POLL_INTERVAL_MS,
+    'enable.auto.commit': false,
+    'enable.partition.eof': false,
+    'fetch.wait.max.ms': 5000,
+    'socket.keepalive.enable': true,
+    'log.connection.close': false,
+    'rebalance_cb': handleRebalance,
+  }, {
+    'auto.offset.reset': 'earliest',
   });
 
-  // Timeouts are sized to the actual per-message budget: PAGE_TIMEOUT (~10s) +
-  // ANALYSIS_TIMEOUT (~3s) plus generous slack. A dead pod or hung crawl now
-  // recovers in tens of seconds instead of multiple minutes.
-  const consumer = kafka.consumer({
-    groupId: KAFKA_GROUP,
-    maxWaitTimeInMs: 5000,
-    sessionTimeout: 45000,
-    heartbeatInterval: 10000,
-    rebalanceTimeout: 60000,
-    maxPollIntervalMs: 60000
+  const producer = new Kafka.Producer({
+    'metadata.broker.list': KAFKA_BROKER,
+    'client.id': `wallet-crawler-producer-${GROUP_INSTANCE_ID}`,
+    'enable.idempotence': true,
+    'compression.codec': 'lz4',
+    'dr_cb': true,
   });
 
-  const producer = kafka.producer();
+  consumer.on('event.error', (err) => console.error(`consumer event.error: ${err.message}`));
+  producer.on('event.error', (err) => console.error(`producer event.error: ${err.message}`));
+  producer.on('delivery-report', (err) => {
+    if (err) console.error(`produce delivery failed: ${err.message}`);
+  });
 
-  await consumer.connect();
-  await producer.connect();
-  await consumer.subscribe({ topic: KAFKA_TOPIC, fromBeginning: true });
+  await new Promise((resolve, reject) => {
+    consumer.once('ready', () => resolve());
+    consumer.once('event.error', reject);
+    consumer.connect();
+  });
+  await new Promise((resolve, reject) => {
+    producer.once('ready', () => resolve());
+    producer.once('event.error', reject);
+    producer.connect();
+  });
+
+  // Drive delivery-report callbacks in the background.
+  producer.setPollInterval(1000);
+
+  consumer.subscribe([KAFKA_TOPIC]);
 
   let consecutiveFailures = 0;
   let siteCounter = 0;
   let session = await startBrowser();
+  let shuttingDown = false;
 
   console.log(`Crawler config: PAGE_TIMEOUT=${PAGE_TIMEOUT}ms, ANALYSIS_TIMEOUT=${ANALYSIS_TIMEOUT}ms, SITES_PER_SESSION=${SITES_PER_SESSION}`);
-  console.log(`Kafka consumer started. Group: ${KAFKA_GROUP}, Topic: ${KAFKA_TOPIC}`);
+  console.log(`Kafka consumer started. Group: ${KAFKA_GROUP}, Topic: ${KAFKA_TOPIC}, instance: ${GROUP_INSTANCE_ID}`);
   //Session compromised error message flag
   const SESSION_DEAD_RE = /Target closed|Session closed|Connection closed|Protocol error/;
-  
-  async function runConsumer() {
-    await consumer.run({
-      autoCommit: false,
-      eachMessage: async ({ topic, partition, message, heartbeat }) => {
-        console.log(`recv p=${partition} off=${message.offset}`);
-        const commitOffset = () =>
-          consumer.commitOffsets([{ topic, partition, offset: (BigInt(message.offset) + 1n).toString() }]);
 
-        // Background heartbeat — kafkajs does not auto-heartbeat during eachMessage,
-        // so a long crawl (esp. MetaMask "wallet connect hard timeout") would
-        // otherwise let the broker session expire and trigger a rebalance.
-        const heartbeatTicker = setInterval(() => {
-          heartbeat().catch(e => console.error(`background heartbeat failed: ${e.message}`));
-        }, 30000);
+  // commitMessage queues the offset for the background commit thread. Calling
+  // it twice for the same message is harmless (offsets are monotonic), so the
+  // analysis-success and analysis-timeout paths can both commit without the
+  // one-shot guard the kafkajs version needed.
+  function commitMessage(message) {
+    try {
+      consumer.commitMessage(message);
+    } catch (e) {
+      console.error(`commit failed off=${message.offset} (likely rebalance, will be redelivered): ${e.message}`);
+    }
+  }
 
-        try {
-        // Session refresh: tear down the browser AND wipe its user-data-dir, then
-        // launch fresh. MetaMask will be re-imported on the new session.
-        if (siteCounter >= SITES_PER_SESSION || session_dead) {
-          logger.debug('Session refresh: restarting browser');
-          await destroySession(session);
-          session = await startBrowser();
-          siteCounter = 0;
-          session_dead = false;
-          consecutiveFailures = 0;
+  async function processMessage(message) {
+    console.log(`recv p=${message.partition} off=${message.offset}`);
+
+    // Session refresh: tear down the browser AND wipe its user-data-dir, then
+    // launch fresh. MetaMask will be re-imported on the new session.
+    if (siteCounter >= SITES_PER_SESSION || session_dead) {
+      logger.debug('Session refresh: restarting browser');
+      await destroySession(session);
+      session = await startBrowser();
+      siteCounter = 0;
+      session_dead = false;
+      consecutiveFailures = 0;
+    }
+
+    const messageStr = message.value.toString();
+    const url = parseUrl(messageStr);
+
+    if (!url) {
+      commitMessage(message);
+      return;
+    }
+
+    metrics.urlsConsumed.inc();
+
+    // Step 1: stamp the crawl_domains tracking collection BEFORE any browser
+    // work. Failure here is non-fatal — we still try to crawl.
+    try {
+      await upsertDomainTimestamp(url);
+    } catch (e) {
+      console.error(`Failed to upsert crawl_domains record for ${url}: ${e.message}`);
+    }
+
+    // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
+    // sel-wire.py:138-181 — three tries, then move on if still failing.
+    // Page interaction is bounded by PAGE_TIMEOUT (default 10s); on expiry
+    // crawlUrlBounded returns a partial result with timedOut: true and we
+    // still flow into the analysis step so any captured requests/scripts
+    // are scanned and persisted.
+    let crawlLog = null;
+    let sessionCompromised = false;
+    let accessedDate;
+    for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
+      try {
+        logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
+        accessedDate = new Date();
+        crawlLog = await crawlUrlBounded(
+          session,
+          `https://${url}`,
+          { ...session.args, secs: 1 },
+          logger,
+          PAGE_TIMEOUT
+        );
+        break;
+      } catch (e) {
+        const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
+        console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
+        if (SESSION_DEAD_RE.test(firstLine)) {
+          sessionCompromised = true;
         }
+        break;
+      }
+    }
 
-        const messageStr = message.value.toString();
-        const url = parseUrl(messageStr);
-
-        if (!url) {
-          await commitOffset();
-          return;
-        }
-
-        metrics.urlsConsumed.inc();
-
-        // Step 1: stamp the crawl_domains tracking collection BEFORE any browser
-        // work. Failure here is non-fatal — we still try to crawl.
-        try {
-          await upsertDomainTimestamp(url);
-        } catch (e) {
-          console.error(`Failed to upsert crawl_domains record for ${url}: ${e.message}`);
-        }
-
-        // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
-        // sel-wire.py:138-181 — three tries, then move on if still failing.
-        // Page interaction is bounded by PAGE_TIMEOUT (default 10s); on expiry
-        // crawlUrlBounded returns a partial result with timedOut: true and we
-        // still flow into the analysis step so any captured requests/scripts
-        // are scanned and persisted.
-        let crawlLog = null;
-        let sessionCompromised = false;
-        let accessedDate;
-        for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
-          await heartbeat();
-          try {
-            logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
-            accessedDate = new Date();
-            crawlLog = await crawlUrlBounded(
-              session,
-              `https://${url}`,
-              { ...session.args, secs: 1 },
-              logger,
-              PAGE_TIMEOUT
-            );
-            break;
-          } catch (e) {
-            const firstLine = (e && e.message ? e.message : String(e)).split('\n')[0];
-            console.error(`Attempt ${attempt}/${MAX_CRAWL_RETRIES} failed for ${url}: ${firstLine}`);
-            if (SESSION_DEAD_RE.test(firstLine)) {
-              sessionCompromised = true;
-            }
-            break;
-          }
-        }
-
-        // Step 3: handle exhausted retries — commit offset and skip the rest.
-        // No publish to crawled-urls, no crawls write.
-        if (!crawlLog) {
-          console.error(`Giving up on ${url} after ${MAX_CRAWL_RETRIES} attempts`);
-          consecutiveFailures++;
-          siteCounter++;
-          if (sessionCompromised) {
-              console.error('Session compromised — rebuilding');
-              await destroySession(session);
-              session = await startBrowser();
-              siteCounter = 0;
-              consecutiveFailures = 0;
-          }
-          else if (consecutiveFailures >= 3) {
-            console.error('Rebuilding session after 3 consecutive failures');
-            await destroySession(session);
-            session = await startBrowser();
-            consecutiveFailures = 0;
-          }
-          try {
-            await commitOffset();
-          } catch (e) {
-            console.error(`commit failed for ${url} (likely rebalance in progress, will be redelivered): ${e.message}`);
-          }
-          await heartbeat();
-          return;
-        }
-        metrics.crawlsCompleted.inc();
+    // Step 3: handle exhausted retries — commit offset and skip the rest.
+    // No publish to crawled-urls, no crawls write.
+    if (!crawlLog) {
+      console.error(`Giving up on ${url} after ${MAX_CRAWL_RETRIES} attempts`);
+      consecutiveFailures++;
+      siteCounter++;
+      if (sessionCompromised) {
+        console.error('Session compromised — rebuilding');
+        await destroySession(session);
+        session = await startBrowser();
+        siteCounter = 0;
         consecutiveFailures = 0;
+      }
+      else if (consecutiveFailures >= 3) {
+        console.error('Rebuilding session after 3 consecutive failures');
+        await destroySession(session);
+        session = await startBrowser();
+        consecutiveFailures = 0;
+      }
+      commitMessage(message);
+      return;
+    }
+    metrics.crawlsCompleted.inc();
+    consecutiveFailures = 0;
 
-        /* Drop the log and consume if the initial response was an HTTP error.
-         * The page returned 4xx/5xx, so there's nothing useful to analyze —
-         * skip straight to commit and move on. */
-        if (typeof crawlLog.status === 'number' && crawlLog.status >= 400) {
-          logger.debug(`Skipping ${url} — HTTP ${crawlLog.status}`);
-          consecutiveFailures = 0;
-          siteCounter++;
-          try { await commitOffset(); } catch (e) { /* ... */ }
-          await heartbeat();
-          return;
-        }
+    /* Drop the log and consume if the initial response was an HTTP error.
+     * The page returned 4xx/5xx, so there's nothing useful to analyze —
+     * skip straight to commit and move on. */
+    if (typeof crawlLog.status === 'number' && crawlLog.status >= 400) {
+      logger.debug(`Skipping ${url} — HTTP ${crawlLog.status}`);
+      consecutiveFailures = 0;
+      siteCounter++;
+      commitMessage(message);
+      return;
+    }
 
-        /* Drop the log and consume if it redirected to a known safe domain */
-        if (crawlLog.redirectedUrl && isSafeRedirectDomain(crawlLog.redirectedUrl)) {
-          logger.debug(`Skipping ${url} — redirected to safe domain: ${crawlLog.redirectedUrl}`);
-          consecutiveFailures = 0;
-          siteCounter++;
-          try { await commitOffset(); } catch (e) { /* ... */ }
-          await heartbeat();
-          return;
-        }
+    /* Drop the log and consume if it redirected to a known safe domain */
+    if (crawlLog.redirectedUrl && isSafeRedirectDomain(crawlLog.redirectedUrl)) {
+      logger.debug(`Skipping ${url} — redirected to safe domain: ${crawlLog.redirectedUrl}`);
+      consecutiveFailures = 0;
+      siteCounter++;
+      commitMessage(message);
+      return;
+    }
 
-        // Steps 4-7: analysis (request scanning, MongoDB insert, Kafka publish,
-        // offset commit). Wrapped in ANALYSIS_TIMEOUT so a stalled DB or broker
-        // cannot wedge the consumer loop. On timeout we still try to commit the
-        // offset to avoid redelivery.
-        // Snapshot the captured requests so late `Network.getResponseBody`
-        // events from in-flight CDP awaits can't mutate response fields under
-        // us mid-scan. Shallow copy is sufficient: scanText reads strings, and
-        // the network handler reassigns properties (responseBody, status,
-        // responseHeaders) rather than mutating their contents.
-        const requestsForAnalysis = (crawlLog.requests || []).map(r => ({ ...r }));
+    // Steps 4-7: analysis (request scanning, MongoDB insert, Kafka publish,
+    // offset commit). Wrapped in ANALYSIS_TIMEOUT so a stalled DB or broker
+    // cannot wedge the consumer loop. On timeout we still commit the offset
+    // to avoid redelivery.
+    // Snapshot the captured requests so late `Network.getResponseBody`
+    // events from in-flight CDP awaits can't mutate response fields under
+    // us mid-scan. Shallow copy is sufficient: scanText reads strings, and
+    // the network handler reassigns properties (responseBody, status,
+    // responseHeaders) rather than mutating their contents.
+    const requestsForAnalysis = (crawlLog.requests || []).map(r => ({ ...r }));
 
-        // One-shot commit guard: whichever of (analysis success, analysis
-        // timeout) runs first commits the offset; the other becomes a no-op.
-        // Avoids the dual-commit race where the deadline fires mid-publish and
-        // both paths reach commitOffset.
-        let committed = false;
-        const tryCommit = async () => {
-          if (committed) return;
-          committed = true;
-          try {
-            await commitOffset();
-          } catch (e) {
-            console.error(`commit failed for ${url} (likely rebalance in progress, will be redelivered): ${e.message}`);
-          }
-        };
+    const analysis = (async () => {
+      // Step 4: scan captured requests for non-false-flagged token hits.
+      const allMapped = mapRequests(requestsForAnalysis);
+      const interestingRequests = [];
+      const matchedTokens = new Set();
+      const matchedAddresses = [];
 
-        const analysis = (async () => {
-          // Step 4: scan captured requests for non-false-flagged token hits.
-          const allMapped = mapRequests(requestsForAnalysis);
-          const interestingRequests = [];
-          const matchedTokens = new Set();
-          const matchedAddresses = [];
-
-          for (const req of allMapped) {
-            //skip request if it's made to a known safe endpoint
-            if (isSafeEndpoint(req.endpoint || '')) continue; 
-            const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
-            const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
-            const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
-            if (urlScan.interesting || reqScan.interesting || respScan.interesting) {
-              const reqTokens = new Set();
-              urlScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
-              reqScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
-              respScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
-              interestingRequests.push({
-                request: req,
-                matchedTokens: [...reqTokens]
-              });
-              urlScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
-              reqScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
-              respScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
-            }
-          }
-
-          // Step 5: detect any privacy interaction the wallet flow recorded.
-          const anyPrivacyInteraction = !!(
-            crawlLog.connected || crawlLog.signature_request || crawlLog.switch_network
-          );
-          const interesting = interestingRequests.length > 0 || anyPrivacyInteraction;
-
-          if (anyPrivacyInteraction) metrics.walletInteractions.inc();
-          if (interestingRequests.length > 0) metrics.filterPassedRequests.inc();
-
-          // Step 6: conditionally write the full record to the crawls collection.
-          if (interesting) {
-            const redirectedUrl = crawlLog.redirectedUrl || url;
-            const status = typeof crawlLog.status === 'number' ? crawlLog.status : -1;
-            const pageSrc = crawlLog.pageSrc || '';
-            const interactions = buildInteractions(crawlLog);
-
-            console.log(
-              `Interesting crawl for ${url}: ${interestingRequests.length} matching requests, ` +
-              `tokens={${Array.from(matchedTokens).join(',')}}, walletInteraction=${anyPrivacyInteraction}`
-            );
-
-            try {
-              // insertCrawlResult swallows Mongo exceptions and returns null on
-              // failure (see mongodb.js:105-108); only count the metric when the
-              // write actually landed.
-              const result = await insertCrawlResult(
-                url,
-                redirectedUrl,
-                accessedDate,
-                status,
-                pageSrc,
-                interestingRequests,
-                interactions,
-                matchedAddresses,
-                crawlLog.evalScripts || [],
-                4 // crawlerVersion — bump when making schema-affecting changes
-              );
-              if (result) {
-                metrics.crawlInserts.inc();
-              }
-            } catch (e) {
-              console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
-            }
-          } else {
-            logger.debug(`Skipping crawls insert for ${url} (no interesting tokens or interactions)`);
-          }
-
-          // Step 7: always publish to crawled-urls on a successful crawl, then
-          // commit the Kafka offset (via tryCommit so the deadline path can't
-          // commit twice).
-          try {
-            await producer.send({
-              topic: INDEX_TOPIC,
-              messages: [{ value: url }]
-            });
-          } catch (e) {
-            console.error(`Failed to produce to ${INDEX_TOPIC} for ${url}: ${e.message}`);
-          }
-
-          await tryCommit();
-        })();
-
-        let analysisTimer;
-        const analysisDeadline = new Promise((_, rej) => {
-          analysisTimer = setTimeout(() => rej(new Error('analysis timeout')), ANALYSIS_TIMEOUT);
-        });
-        // Pre-attach a swallow so a late rejection from the deadline (if Race
-        // already resolved on `analysis`) doesn't surface as unhandled.
-        analysisDeadline.catch(() => {});
-        try {
-          await Promise.race([analysis, analysisDeadline]);
-        } catch (e) {
-          if (e && e.message === 'analysis timeout') {
-            console.warn(`Analysis exceeded ${ANALYSIS_TIMEOUT}ms for ${url} — committing offset and moving on`);
-            await tryCommit();
-          } else {
-            console.error(`Analysis error for ${url}: ${e && e.message ? e.message : e}`);
-          }
-          // Suppress any late rejection from the still-running analysis promise.
-          analysis.catch(() => {});
-        } finally {
-          clearTimeout(analysisTimer);
-        }
-
-        await heartbeat();
-        siteCounter++;
-        } finally {
-          clearInterval(heartbeatTicker);
+      for (const req of allMapped) {
+        //skip request if it's made to a known safe endpoint
+        if (isSafeEndpoint(req.endpoint || '')) continue;
+        const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
+        const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
+        const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
+        if (urlScan.interesting || reqScan.interesting || respScan.interesting) {
+          const reqTokens = new Set();
+          urlScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+          reqScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+          respScan.tokens.forEach(t => { matchedTokens.add(t); reqTokens.add(t); });
+          interestingRequests.push({
+            request: req,
+            matchedTokens: [...reqTokens]
+          });
+          urlScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+          reqScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
+          respScan.addresses.forEach(a => matchedAddresses.push(a.split(':')));
         }
       }
+
+      // Step 5: detect any privacy interaction the wallet flow recorded.
+      const anyPrivacyInteraction = !!(
+        crawlLog.connected || crawlLog.signature_request || crawlLog.switch_network
+      );
+      const interesting = interestingRequests.length > 0 || anyPrivacyInteraction;
+
+      if (anyPrivacyInteraction) metrics.walletInteractions.inc();
+      if (interestingRequests.length > 0) metrics.filterPassedRequests.inc();
+
+      // Step 6: conditionally write the full record to the crawls collection.
+      if (interesting) {
+        const redirectedUrl = crawlLog.redirectedUrl || url;
+        const status = typeof crawlLog.status === 'number' ? crawlLog.status : -1;
+        const pageSrc = crawlLog.pageSrc || '';
+        const interactions = buildInteractions(crawlLog);
+
+        console.log(
+          `Interesting crawl for ${url}: ${interestingRequests.length} matching requests, ` +
+          `tokens={${Array.from(matchedTokens).join(',')}}, walletInteraction=${anyPrivacyInteraction}`
+        );
+
+        try {
+          // insertCrawlResult swallows Mongo exceptions and returns null on
+          // failure (see mongodb.js:105-108); only count the metric when the
+          // write actually landed.
+          const result = await insertCrawlResult(
+            url,
+            redirectedUrl,
+            accessedDate,
+            status,
+            pageSrc,
+            interestingRequests,
+            interactions,
+            matchedAddresses,
+            crawlLog.evalScripts || [],
+            4 // crawlerVersion — bump when making schema-affecting changes
+          );
+          if (result) {
+            metrics.crawlInserts.inc();
+          }
+        } catch (e) {
+          console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
+        }
+      } else {
+        logger.debug(`Skipping crawls insert for ${url} (no interesting tokens or interactions)`);
+      }
+
+      // Step 7: always publish to crawled-urls on a successful crawl, then
+      // commit the Kafka offset. produce() is non-blocking; the
+      // delivery-report listener logs failures.
+      try {
+        producer.produce(INDEX_TOPIC, null, Buffer.from(url), null, Date.now());
+      } catch (e) {
+        console.error(`Failed to produce to ${INDEX_TOPIC} for ${url}: ${e.message}`);
+      }
+
+      commitMessage(message);
+    })();
+
+    let analysisTimer;
+    const analysisDeadline = new Promise((_, rej) => {
+      analysisTimer = setTimeout(() => rej(new Error('analysis timeout')), ANALYSIS_TIMEOUT);
+    });
+    // Pre-attach a swallow so a late rejection from the deadline (if Race
+    // already resolved on `analysis`) doesn't surface as unhandled.
+    analysisDeadline.catch(() => {});
+    try {
+      await Promise.race([analysis, analysisDeadline]);
+    } catch (e) {
+      if (e && e.message === 'analysis timeout') {
+        console.warn(`Analysis exceeded ${ANALYSIS_TIMEOUT}ms for ${url} — committing offset and moving on`);
+        commitMessage(message);
+      } else {
+        console.error(`Analysis error for ${url}: ${e && e.message ? e.message : e}`);
+      }
+      // Suppress any late rejection from the still-running analysis promise.
+      analysis.catch(() => {});
+    } finally {
+      clearTimeout(analysisTimer);
+    }
+
+    siteCounter++;
+  }
+
+  // Pull one message, process it, commit, then pull again. Mirrors the
+  // kafkajs eachMessage cadence (one-at-a-time, ordered per partition) while
+  // letting librdkafka manage heartbeats and fetches on its own thread.
+  function pullOne() {
+    if (shuttingDown) return;
+    consumer.consume(1, async (err, messages) => {
+      if (err) {
+        console.error(`consume err: ${err.message}`);
+        if (!shuttingDown) setTimeout(pullOne, 1000);
+        return;
+      }
+      if (!messages || messages.length === 0) {
+        if (!shuttingDown) setImmediate(pullOne);
+        return;
+      }
+      const message = messages[0];
+      try {
+        await processMessage(message);
+      } catch (e) {
+        console.error(`processMessage threw off=${message.offset}: ${e && e.message ? e.message : e}`);
+        // Still commit so a programming bug doesn't wedge the partition.
+        commitMessage(message);
+      }
+      if (!shuttingDown) pullOne();
     });
   }
 
-  consumer.on(consumer.events.CRASH, async (event) => {
-    console.error('Consumer crashed, restarting in 5s:', event.payload.error.message);
-    await sleep(5000);
+  // Graceful shutdown: consumer.disconnect sends LeaveGroup. With static
+  // membership, the broker holds this instance's assignment for
+  // session.timeout.ms — so a systemd restart finishing inside that window
+  // triggers zero rebalance.
+  function shutdown(sig) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${sig} received, shutting down...`);
+    const hardExit = setTimeout(() => {
+      console.error('Shutdown deadline reached, exiting with code 1');
+      process.exit(1);
+    }, 15000);
+    hardExit.unref();
     try {
-      await consumer.connect();
-      await runConsumer();
+      consumer.disconnect(() => {
+        producer.flush(5000, () => {
+          producer.disconnect(() => {
+            clearTimeout(hardExit);
+            process.exit(0);
+          });
+        });
+      });
     } catch (e) {
-      console.error('Consumer failed to restart, exiting:', e.message);
+      console.error(`shutdown error: ${e.message}`);
       process.exit(1);
     }
-  });
+  }
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 
-  await runConsumer();
-  
+  pullOne();
 }
 
 main().catch(e => {

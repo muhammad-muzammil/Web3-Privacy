@@ -19,6 +19,12 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     fonts-liberation \
     fonts-noto-color-emoji \
+    build-essential \
+    python3 \
+    libsasl2-dev \
+    libssl-dev \
+    liblz4-dev \
+    libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /crawler
