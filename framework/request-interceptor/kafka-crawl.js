@@ -345,13 +345,16 @@ async function main() {
     brokers: [KAFKA_BROKER]
   });
 
+  // Timeouts are sized to the actual per-message budget: PAGE_TIMEOUT (~10s) +
+  // ANALYSIS_TIMEOUT (~3s) plus generous slack. A dead pod or hung crawl now
+  // recovers in tens of seconds instead of multiple minutes.
   const consumer = kafka.consumer({
     groupId: KAFKA_GROUP,
-    maxWaitTimeInMs: 10000,
-    sessionTimeout: 300000,
+    maxWaitTimeInMs: 5000,
+    sessionTimeout: 45000,
     heartbeatInterval: 10000,
-    rebalanceTimeout:300000,
-    maxPollIntervalMs: 900000
+    rebalanceTimeout: 60000,
+    maxPollIntervalMs: 60000
   });
 
   const producer = kafka.producer();
@@ -406,14 +409,12 @@ async function main() {
 
         metrics.urlsConsumed.inc();
 
-        const accessedDate = new Date();
-
-        // Step 1: stamp the domains tracking collection BEFORE any browser work.
-        // Failure here is non-fatal — we still try to crawl.
+        // Step 1: stamp the crawl_domains tracking collection BEFORE any browser
+        // work. Failure here is non-fatal — we still try to crawl.
         try {
           await upsertDomainTimestamp(url);
         } catch (e) {
-          console.error(`Failed to upsert domains record for ${url}: ${e.message}`);
+          console.error(`Failed to upsert crawl_domains record for ${url}: ${e.message}`);
         }
 
         // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
@@ -424,10 +425,12 @@ async function main() {
         // are scanned and persisted.
         let crawlLog = null;
         let sessionCompromised = false;
+        let accessedDate;
         for (let attempt = 1; attempt <= MAX_CRAWL_RETRIES; attempt++) {
           await heartbeat();
           try {
             logger.debug(`Crawling ${url} (attempt ${attempt}/${MAX_CRAWL_RETRIES})`);
+            accessedDate = new Date();
             crawlLog = await crawlUrlBounded(
               session,
               `https://${url}`,
@@ -481,7 +484,6 @@ async function main() {
          * skip straight to commit and move on. */
         if (typeof crawlLog.status === 'number' && crawlLog.status >= 400) {
           logger.debug(`Skipping ${url} — HTTP ${crawlLog.status}`);
-          metrics.crawlsCompleted.inc();
           consecutiveFailures = 0;
           siteCounter++;
           try { await commitOffset(); } catch (e) { /* ... */ }
@@ -492,7 +494,6 @@ async function main() {
         /* Drop the log and consume if it redirected to a known safe domain */
         if (crawlLog.redirectedUrl && isSafeRedirectDomain(crawlLog.redirectedUrl)) {
           logger.debug(`Skipping ${url} — redirected to safe domain: ${crawlLog.redirectedUrl}`);
-          metrics.crawlsCompleted.inc();
           consecutiveFailures = 0;
           siteCounter++;
           try { await commitOffset(); } catch (e) { /* ... */ }
@@ -576,7 +577,10 @@ async function main() {
             );
 
             try {
-              await insertCrawlResult(
+              // insertCrawlResult swallows Mongo exceptions and returns null on
+              // failure (see mongodb.js:105-108); only count the metric when the
+              // write actually landed.
+              const result = await insertCrawlResult(
                 url,
                 redirectedUrl,
                 accessedDate,
@@ -586,9 +590,11 @@ async function main() {
                 interactions,
                 matchedAddresses,
                 crawlLog.evalScripts || [],
-                3 // crawlerVersion — bump when making schema-affecting changes
+                4 // crawlerVersion — bump when making schema-affecting changes
               );
-              metrics.crawlInserts.inc();
+              if (result) {
+                metrics.crawlInserts.inc();
+              }
             } catch (e) {
               console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
             }

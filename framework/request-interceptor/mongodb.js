@@ -137,13 +137,18 @@ async function upsertDomainTimestamp(url) {
     throw new Error('Database not initialized. Call initDb first.');
   }
   try {
-    await db.collection('domains').updateOne(
+    // $setOnInsert keeps _id immutable (and matches the bridge's pattern at
+    // ctbridge/certstream-bridge.py); $set always refreshes the timestamp.
+    await db.collection('crawl_domains').updateOne(
       { _id: url },
-      { $set: { _id: url, timestamp: new Date() } },
+      {
+        $setOnInsert: { _id: url },
+        $set: { timestamp: new Date() }
+      },
       { upsert: true }
     );
   } catch (e) {
-    console.error(`Failed to upsert domains record for ${url}: ${e.message}`);
+    console.error(`Failed to upsert crawl_domains record for ${url}: ${e.message}`);
   }
 }
 
