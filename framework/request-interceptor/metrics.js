@@ -1,13 +1,7 @@
 const http = require('http');
-const os = require('os');
 const client = require('prom-client');
 
 const register = client.register;
-
-register.setDefaultLabels({
-  host: os.hostname(),
-  instance: process.env.INSTANCE_ID || '0'
-});
 
 const urlsConsumed = new client.Counter({
   name: 'wallet_crawler_urls_consumed_total',
