@@ -4,7 +4,7 @@ require('dotenv').config();
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { Kafka, CooperativeStickyAssignor } = require('kafkajs');
+const { Kafka } = require('kafkajs');
 const chromePuppeteerLib = require('./chrome/puppeteer.js');
 const chromeLoggerLib = require('./chrome/logging.js');
 const { crawlUrl } = require('./chrome/crawl.js');
@@ -350,7 +350,6 @@ async function main() {
   // recovers in tens of seconds instead of multiple minutes.
   const consumer = kafka.consumer({
     groupId: KAFKA_GROUP,
-    partitionAssigners: [CooperativeStickyAssignor],
     maxWaitTimeInMs: 5000,
     sessionTimeout: 45000,
     heartbeatInterval: 10000,
