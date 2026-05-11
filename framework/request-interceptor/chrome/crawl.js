@@ -220,7 +220,7 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
   }
 
   logger.debug(`Visiting ${url}`)
-  await page.goto(url, {waitUntil: "domcontentloaded", timeout: 2000})
+  await page.goto(url, {waitUntil: "domcontentloaded", timeout: 3000})
   await page.bringToFront()
 
   const client = await page.target().createCDPSession();
@@ -243,7 +243,19 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
     }
   }
 
-  // Connect to DApp. Soft race: at the 8s mark we move on to the dwell phase,
+  // Short-circuit on HTTP error: wallet-connect and dwell would only burn time
+  // on an error page. Return the partial log so the caller can commit and move on.
+  if (log.status >= 400) {
+    logger.debug('\x1b[91mHTTP '+log.status+' for '+url+' — skipping wallet flow and dwell\x1b[0m')
+    log.success = false
+    log.requests = requestLog.requests.slice(requestsBefore)
+    log.evalScripts = requestLog.evalScripts ? requestLog.evalScripts.slice(evalScriptsBefore) : []
+    log.cookies = []
+    try { await page.close() } catch {}
+    return log
+  }
+
+  // Connect to DApp. Soft race: at the 5s mark we move on to the dwell phase,
   // but `connectMetaMaskWallet` keeps running in the background — its in-flight
   // button clicks and popup detection continue to fire network requests we want
   // to capture, and if the full flow finishes during dwell we still record the
@@ -259,7 +271,7 @@ const crawlUrl = async (browser, requestLog, cdpClients, url, args, logger, skip
 
   await Promise.race([
     walletPromise,
-    new Promise(resolve => setTimeout(resolve, 8000))
+    new Promise(resolve => setTimeout(resolve, 6000))
   ]);
 
   if (args.links === undefined) {

@@ -431,7 +431,7 @@ async function main() {
             crawlLog = await crawlUrlBounded(
               session,
               `https://${url}`,
-              { ...session.args, secs: 5 },
+              { ...session.args, secs: 1 },
               logger,
               PAGE_TIMEOUT
             );
@@ -475,6 +475,19 @@ async function main() {
         }
         metrics.crawlsCompleted.inc();
         consecutiveFailures = 0;
+
+        /* Drop the log and consume if the initial response was an HTTP error.
+         * The page returned 4xx/5xx, so there's nothing useful to analyze —
+         * skip straight to commit and move on. */
+        if (typeof crawlLog.status === 'number' && crawlLog.status >= 400) {
+          logger.debug(`Skipping ${url} — HTTP ${crawlLog.status}`);
+          metrics.crawlsCompleted.inc();
+          consecutiveFailures = 0;
+          siteCounter++;
+          try { await commitOffset(); } catch (e) { /* ... */ }
+          await heartbeat();
+          return;
+        }
 
         /* Drop the log and consume if it redirected to a known safe domain */
         if (crawlLog.redirectedUrl && isSafeRedirectDomain(crawlLog.redirectedUrl)) {
