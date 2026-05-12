@@ -60,6 +60,14 @@ const isSafeEndpoint = (url) => safeEndpointDomains.some(
     safe => { try { return new URL(url).hostname.endsWith(safe); } catch { return false; } }
   );
 
+// Drops requests whose URL scheme is not a real page resource (extension
+// internals, devtools, about:blank). MetaMask's extension fetches were
+// landing in additionalRequests and bloating crawls documents.
+const isIgnoredRequestUrl = (url) =>
+  url.startsWith('chrome-extension://') ||
+  url.startsWith('devtools://') ||
+  url.startsWith('about:');
+
 /**
  * Parse URL from Certificate Transparency stream message.
  * Handles formats: "DNS:example.com", "IP Address:1.2.3.4", or raw domain.
@@ -137,6 +145,7 @@ async function startBrowser() {
       }
 
       const requestUrl = request.url();
+      if (isIgnoredRequestUrl(requestUrl)) return;
       const requestType = request.resourceType()[0].toUpperCase() + request.resourceType().substring(1);
       const requestMethod = request.method();
       const requestHeaders = {};

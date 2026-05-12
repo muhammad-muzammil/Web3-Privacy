@@ -48,6 +48,11 @@ const onRequest = async (options, requestLog, request) => {
   }
 
   const requestUrl = request.url()
+  if (requestUrl.startsWith('chrome-extension://') ||
+      requestUrl.startsWith('devtools://') ||
+      requestUrl.startsWith('about:')) {
+    return
+  }
   const requestType = request.resourceType()[0].toUpperCase() + request.resourceType().substring(1)
   const requestMethod = request.method()
   const requestHeaders = normalizeHeaders(request.headers())
