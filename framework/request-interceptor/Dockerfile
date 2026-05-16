@@ -40,6 +40,7 @@ COPY match.js .
 COPY metrics.js .
 COPY address-check.js .
 COPY mongodb.js .
+COPY buffer.js .
 COPY run.js .
 
 # Token match configuration (consumed by match.js -> loadConfig at startup)

@@ -190,10 +190,90 @@ function buildInteractions(crawlLog) {
   return interactions;
 }
 
+/**
+ * Build a bulkWrite ops array for the crawl_domains collection.
+ * Mirrors the upsert shape used by upsertDomainTimestamp so the drain path
+ * and the (now-unused) inline path produce identical documents.
+ *
+ * @param {Array<{url: string, ts: string|Date}>} records
+ * @returns {Array} ops array ready for collection.bulkWrite()
+ */
+function buildDomainTimestampOps(records) {
+  return records.map(rec => ({
+    updateOne: {
+      filter: { _id: rec.url },
+      update: {
+        $setOnInsert: { _id: rec.url },
+        $set: { timestamp: rec.ts instanceof Date ? rec.ts : new Date(rec.ts) }
+      },
+      upsert: true
+    }
+  }));
+}
+
+/**
+ * Build a bulkWrite ops array for the crawls collection.
+ * Mirrors the followup-aware upsert shape used by insertCrawlResult so the
+ * drain path produces identical documents (including the followups[] append
+ * on re-crawls). Date strings from JSONL serialisation are rehydrated.
+ *
+ * @param {Array<Object>} records crawl-result docs as written by buffer.appendCrawlResult
+ * @returns {Array} ops array ready for collection.bulkWrite()
+ */
+function buildCrawlResultOps(records) {
+  return records.map(rec => {
+    const accessedDate = rec.accessedDate instanceof Date
+      ? rec.accessedDate
+      : new Date(rec.accessedDate);
+    const crawlData = {
+      redirectedUrl: rec.redirectedUrl,
+      accessedDate,
+      status: rec.status,
+      pageSrc: rec.pageSrc,
+      additionalRequests: rec.additionalRequests,
+      interactions: rec.interactions,
+      matchedAddresses: rec.matchedAddresses,
+      evalScripts: rec.evalScripts,
+      crawlerVersion: rec.crawlerVersion
+    };
+    return {
+      updateOne: {
+        filter: { url: rec.url },
+        update: [
+          {
+            $set: {
+              url: { $ifNull: ['$url', rec.url] },
+              redirectedUrl: { $ifNull: ['$redirectedUrl', rec.redirectedUrl] },
+              accessedDate: { $ifNull: ['$accessedDate', accessedDate] },
+              status: { $ifNull: ['$status', rec.status] },
+              pageSrc: { $ifNull: ['$pageSrc', rec.pageSrc] },
+              additionalRequests: { $ifNull: ['$additionalRequests', rec.additionalRequests] },
+              interactions: { $ifNull: ['$interactions', rec.interactions] },
+              matchedAddresses: { $ifNull: ['$matchedAddresses', rec.matchedAddresses] },
+              evalScripts: { $ifNull: ['$evalScripts', rec.evalScripts] },
+              crawlerVersion: rec.crawlerVersion,
+              followups: {
+                $cond: {
+                  if: { $isArray: '$followups' },
+                  then: { $concatArrays: ['$followups', [crawlData]] },
+                  else: []
+                }
+              }
+            }
+          }
+        ],
+        upsert: true
+      }
+    };
+  });
+}
+
 module.exports = {
   initDb,
   insertCrawlResult,
   upsertDomainTimestamp,
   mapRequests,
-  buildInteractions
+  buildInteractions,
+  buildDomainTimestampOps,
+  buildCrawlResultOps
 };

@@ -28,6 +28,27 @@ const filterPassedRequests = new client.Counter({
   help: 'Crawls where at least one captured request passed the search-term/false-flag filter.'
 });
 
+const drainPhases = new client.Counter({
+  name: 'wallet_crawler_drain_phases_total',
+  help: 'Number of times the crawler has entered the buffer drain phase.'
+});
+
+const drainSeconds = new client.Counter({
+  name: 'wallet_crawler_drain_seconds_total',
+  help: 'Cumulative wall-clock seconds spent draining the on-disk buffer to MongoDB.'
+});
+
+const drainRecords = new client.Counter({
+  name: 'wallet_crawler_drain_records_total',
+  help: 'Cumulative records flushed from the on-disk buffer to MongoDB.',
+  labelNames: ['collection']
+});
+
+const bufferBytes = new client.Gauge({
+  name: 'wallet_crawler_buffer_bytes',
+  help: 'Total size in bytes of this instance\'s active on-disk buffer files.'
+});
+
 const port = parseInt(process.env.METRICS_PORT || '9090', 10);
 
 const server = http.createServer(async (req, res) => {
@@ -54,4 +75,14 @@ server.on('error', (e) => {
   console.error(`Metrics server error: ${e.message}`);
 });
 
-module.exports = { urlsConsumed, crawlInserts, crawlsCompleted, walletInteractions, filterPassedRequests };
+module.exports = {
+  urlsConsumed,
+  crawlInserts,
+  crawlsCompleted,
+  walletInteractions,
+  filterPassedRequests,
+  drainPhases,
+  drainSeconds,
+  drainRecords,
+  bufferBytes
+};

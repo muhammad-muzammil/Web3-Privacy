@@ -11,11 +11,10 @@ const { crawlUrl } = require('./chrome/crawl.js');
 const { importMetaMaskWallet } = require('./chrome/helper.js');
 const {
   initDb,
-  insertCrawlResult,
-  upsertDomainTimestamp,
   mapRequests,
   buildInteractions
 } = require('./mongodb.js');
+const buffer = require('./buffer.js');
 const { loadConfig, scanText } = require('./match.js');
 const metrics = require('./metrics.js');
 
@@ -33,6 +32,12 @@ const PAGE_TIMEOUT = parseInt(process.env.PAGE_TIMEOUT || '18', 10) * 1000;
 // shorter budget so a stalled DB or broker cannot wedge the consumer loop.
 const ANALYSIS_TIMEOUT = parseInt(process.env.ANALYSIS_TIMEOUT || '5', 10) * 1000;
 const SITES_PER_SESSION = parseInt(process.env.SITES_PER_SESSION || '100', 10);
+// Buffer config: writes are appended to per-instance JSONL files under
+// BUFFER_DIR and bulk-flushed once an active file exceeds BUFFER_FLUSH_SIZE_MB.
+// DRAIN_BATCH_SIZE caps how many records each bulkWrite chunk submits.
+const BUFFER_DIR = process.env.BUFFER_DIR || '/var/lib/wallet-crawler/buffer';
+const BUFFER_FLUSH_SIZE_MB = parseInt(process.env.BUFFER_FLUSH_SIZE_MB || '500', 10);
+const DRAIN_BATCH_SIZE = parseInt(process.env.DRAIN_BATCH_SIZE || '500', 10);
 const DEBUG_LEVEL = process.env.DEBUG_LEVEL || 'none';
 const MAX_CRAWL_RETRIES = 1;
 var session_dead = false;
@@ -360,6 +365,24 @@ async function main() {
   const SESSION_TIMEOUT_MS = parseInt(process.env.KAFKA_SESSION_TIMEOUT_MS || '60000', 10);
   const MAX_POLL_INTERVAL_MS = parseInt(process.env.KAFKA_MAX_POLL_INTERVAL_MS || '300000', 10);
 
+  // Per-instance write buffer. Inline Mongo writes have moved off the hot path
+  // — both pre-crawl domain stamps and post-analysis crawl results are appended
+  // to local JSONL files and bulk-flushed during periodic drain phases.
+  buffer.init({
+    bufferDir: BUFFER_DIR,
+    instanceId: GROUP_INSTANCE_ID,
+    flushThresholdBytes: BUFFER_FLUSH_SIZE_MB * 1024 * 1024,
+    drainBatchSize: DRAIN_BATCH_SIZE
+  });
+  // Finish any drain that was in progress when a previous run died. Runs
+  // before we accept any new messages so a partly-flushed `.draining` file
+  // can't be appended-to or re-renamed mid-recovery.
+  try {
+    await buffer.resumeIncompleteDrain(db);
+  } catch (e) {
+    console.error(`resumeIncompleteDrain failed: ${e.message}`);
+  }
+
   function handleRebalance(err, assignment) {
     if (err.code === Kafka.CODES.ERRORS.ERR__ASSIGN_PARTITIONS) {
       try { consumer.incrementalAssign(assignment); }
@@ -433,9 +456,54 @@ async function main() {
   let shuttingDown = false;
 
   console.log(`Crawler config: PAGE_TIMEOUT=${PAGE_TIMEOUT}ms, ANALYSIS_TIMEOUT=${ANALYSIS_TIMEOUT}ms, SITES_PER_SESSION=${SITES_PER_SESSION}`);
+  console.log(`Buffer config: BUFFER_DIR=${BUFFER_DIR}, BUFFER_FLUSH_SIZE_MB=${BUFFER_FLUSH_SIZE_MB}, DRAIN_BATCH_SIZE=${DRAIN_BATCH_SIZE}`);
   console.log(`Kafka consumer started. Group: ${KAFKA_GROUP}, Topic: ${KAFKA_TOPIC}, instance: ${GROUP_INSTANCE_ID}`);
   //Session compromised error message flag
   const SESSION_DEAD_RE = /Target closed|Session closed|Connection closed|Protocol error/;
+
+  // Single-flight guard for the drain phase. Set true when a drain is in
+  // progress so pullOne does not re-enter it concurrently. The flag is checked
+  // and flipped on the same JS turn so no atomicity primitive is needed.
+  let draining = false;
+  // Reference to the most-recently-launched drain promise. shutdown() awaits
+  // this with a short grace timeout so a SIGTERM mid-drain doesn't force the
+  // next process to replay the in-flight chunk on startup.
+  let drainPromise = null;
+
+  // Pause Kafka consumption, bulk-flush both buffer files to MongoDB, then
+  // resume. The pullOne loop keeps calling consume() during the drain — with
+  // partitions paused, those calls return empty batches, which is enough to
+  // satisfy max.poll.interval.ms and keep the group assignment intact even
+  // for multi-hour drains.
+  async function runDrainPhase() {
+    if (draining) return;
+    draining = true;
+    metrics.bufferBytes.set(buffer.bufferedBytes());
+    console.log('Buffer threshold reached, entering drain phase');
+    try {
+      consumer.pause(consumer.assignments());
+    } catch (e) {
+      console.error(`pause failed: ${e.message}`);
+    }
+    try {
+      const result = await buffer.drain(db);
+      metrics.drainPhases.inc();
+      metrics.drainSeconds.inc(result.elapsedMs / 1000);
+      metrics.drainRecords.inc({ collection: 'crawl_domains' }, result.domains);
+      metrics.drainRecords.inc({ collection: 'crawls' }, result.crawls);
+      metrics.crawlInserts.inc(result.crawls);
+    } catch (e) {
+      console.error(`drain phase failed: ${e.message}`);
+    } finally {
+      try {
+        consumer.resume(consumer.assignments());
+      } catch (e) {
+        console.error(`resume failed: ${e.message}`);
+      }
+      metrics.bufferBytes.set(buffer.bufferedBytes());
+      draining = false;
+    }
+  }
 
   // commitMessage queues the offset for the background commit thread. Calling
   // it twice for the same message is harmless (offsets are monotonic), so the
@@ -473,12 +541,13 @@ async function main() {
 
     metrics.urlsConsumed.inc();
 
-    // Step 1: stamp the crawl_domains tracking collection BEFORE any browser
-    // work. Failure here is non-fatal — we still try to crawl.
+    // Step 1: queue the crawl_domains tracking record into the local buffer
+    // BEFORE any browser work. The actual Mongo upsert happens during the
+    // next drain phase; failure here is non-fatal — we still try to crawl.
     try {
-      await upsertDomainTimestamp(url);
+      buffer.appendDomainTimestamp(url);
     } catch (e) {
-      console.error(`Failed to upsert crawl_domains record for ${url}: ${e.message}`);
+      console.error(`Failed to append crawl_domains buffer entry for ${url}: ${e.message}`);
     }
 
     // Step 2: crawl with up to MAX_CRAWL_RETRIES attempts. Mimics
@@ -618,26 +687,23 @@ async function main() {
         );
 
         try {
-          // insertCrawlResult swallows Mongo exceptions and returns null on
-          // failure (see mongodb.js:105-108); only count the metric when the
-          // write actually landed.
-          const result = await insertCrawlResult(
+          // Queue the full crawl document to the on-disk buffer; the actual
+          // Mongo upsert (and the corresponding crawlInserts counter bump)
+          // happens during the next drain phase.
+          buffer.appendCrawlResult({
             url,
             redirectedUrl,
             accessedDate,
             status,
             pageSrc,
-            interestingRequests,
+            additionalRequests: interestingRequests,
             interactions,
             matchedAddresses,
-            crawlLog.evalScripts || [],
-            4 // crawlerVersion — bump when making schema-affecting changes
-          );
-          if (result) {
-            metrics.crawlInserts.inc();
-          }
+            evalScripts: crawlLog.evalScripts || [],
+            crawlerVersion: 5 // bump when making schema-affecting changes
+          });
         } catch (e) {
-          console.error(`Failed to insert crawls record for ${url}: ${e.message}`);
+          console.error(`Failed to append crawls buffer entry for ${url}: ${e.message}`);
         }
       } else {
         logger.debug(`Skipping crawls insert for ${url} (no interesting tokens or interactions)`);
@@ -703,6 +769,15 @@ async function main() {
         // Still commit so a programming bug doesn't wedge the partition.
         commitMessage(message);
       }
+      // Fire-and-forget drain trigger. runDrainPhase pauses the consumer
+      // before flushing, so the consume() calls below return empty messages
+      // (no work) while the drain runs in parallel — keeping the consumer
+      // inside max.poll.interval.ms regardless of how long the drain takes.
+      // The promise is captured (not awaited here) so shutdown() can wait on
+      // it before disconnecting.
+      if (!draining && !shuttingDown && buffer.shouldDrain()) {
+        drainPromise = runDrainPhase().catch(e => console.error(`runDrainPhase: ${e && e.message ? e.message : e}`));
+      }
       if (!shuttingDown) pullOne();
     });
   }
@@ -711,15 +786,37 @@ async function main() {
   // membership, the broker holds this instance's assignment for
   // session.timeout.ms — so a systemd restart finishing inside that window
   // triggers zero rebalance.
-  function shutdown(sig) {
+  //
+  // If a drain is in flight we await it (up to DRAIN_SHUTDOWN_GRACE_MS) before
+  // disconnect: the drain runs against MongoDB independently of the Kafka
+  // connection, and finishing it here avoids forcing the next process to
+  // replay the in-flight chunk (which would double-write crawl followups[]
+  // via $concatArrays). Total in-process budget is bumped from 15s to 25s,
+  // still comfortably under the 30s `docker stop --time=30` ceiling.
+  const DRAIN_SHUTDOWN_GRACE_MS = 15000;
+  async function shutdown(sig) {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`${sig} received, shutting down...`);
     const hardExit = setTimeout(() => {
       console.error('Shutdown deadline reached, exiting with code 1');
       process.exit(1);
-    }, 15000);
+    }, 25000);
     hardExit.unref();
+    if (drainPromise) {
+      console.log(`Awaiting in-flight drain (up to ${DRAIN_SHUTDOWN_GRACE_MS}ms) before disconnect`);
+      const drainStart = Date.now();
+      await Promise.race([
+        drainPromise,
+        new Promise(resolve => setTimeout(resolve, DRAIN_SHUTDOWN_GRACE_MS))
+      ]);
+      const elapsed = Date.now() - drainStart;
+      if (draining) {
+        console.warn(`Drain still running after ${elapsed}ms grace — proceeding to disconnect; remainder will replay on restart`);
+      } else {
+        console.log(`Drain settled in ${elapsed}ms`);
+      }
+    }
     try {
       consumer.disconnect(() => {
         producer.flush(5000, () => {
