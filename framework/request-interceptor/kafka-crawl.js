@@ -177,15 +177,27 @@ async function startBrowser() {
     });
 
     const cdpClient = await page.target().createCDPSession();
-    await cdpClient.send('Network.enable');
-    await cdpClient.send('Page.enable');
-
-    // Filter eval-script capture by the page's URL at parse time. Gating at
-    // targetcreated was unreliable — MetaMask popup targets often report
-    // about:blank or '' before navigating to chrome-extension://..., so the
-    // gate let their internal generated scripts through. Checking page.url()
-    // when each script is parsed catches the popup case correctly.
-    await cdpClient.send('Debugger.enable');
+    // Transient targets (MetaMask popups, ephemeral about:blank tabs, pages
+    // destroyed by navigation) often close between createCDPSession() and the
+    // enables below. Without this guard those rejections bubble out of the
+    // async event handler as UnhandledPromiseRejections and crash the process
+    // — see the unhandledRejection backstop in main() for the same reason.
+    try {
+      await cdpClient.send('Network.enable');
+      await cdpClient.send('Page.enable');
+      // Filter eval-script capture by the page's URL at parse time. Gating at
+      // targetcreated was unreliable — MetaMask popup targets often report
+      // about:blank or '' before navigating to chrome-extension://..., so the
+      // gate let their internal generated scripts through. Checking page.url()
+      // when each script is parsed catches the popup case correctly.
+      await cdpClient.send('Debugger.enable');
+    } catch (e) {
+      if (/Target closed|Session closed|Connection closed|Protocol error/.test(e.message || '')) {
+        logger.debug(`CDP attach raced target close: ${e.message}`);
+        return;
+      }
+      throw e;
+    }
 
     cdpClient.on('Debugger.scriptParsed', async (params) => {
       if (params.url) return; // scripts with a URL are captured by the network handler
@@ -346,6 +358,22 @@ async function crawlUrlBounded(session, url, args, logger, ms) {
 }
 
 async function main() {
+  // Backstop for stray promise rejections from async event handlers (CDP
+  // sessions on transient targets, Puppeteer page events, etc.) that nobody
+  // is awaiting. Node 20's default is to throw on unhandled rejections,
+  // which would crash the process and force a systemd restart cycle. Log
+  // and continue instead — these are almost always benign target-close
+  // races, not state-corrupting bugs.
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason && reason.message ? reason.message : String(reason);
+    if (/Target closed|Session closed|Connection closed|Protocol error/.test(msg)) {
+      console.warn(`unhandledRejection (target race, ignoring): ${msg}`);
+    } else {
+      console.error(`unhandledRejection: ${msg}`);
+      if (reason && reason.stack) console.error(reason.stack);
+    }
+  });
+
   // Initialize MongoDB
   const db = await initDb();
   if (!db) {

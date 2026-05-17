@@ -17,6 +17,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 const { buildDomainTimestampOps, buildCrawlResultOps } = require('./mongodb.js');
 
 let bufferDir = null;
@@ -73,10 +74,12 @@ function bufferedBytes() {
 /**
  * Drain one collection's `.draining` file (renaming the active file first if
  * no `.draining` already exists). Returns the number of records bulk-written.
+ * Reads the file with a line-streaming reader so peak memory is bounded by
+ * one line plus the in-flight bulkWrite batch — not the file size.
  *
- * For crawl_domains, all records are read into memory and coalesced to the
- * latest timestamp per URL before bulkWrite — `.draining.offset` is unused
- * because the upsert is fully idempotent on replay.
+ * For crawl_domains, lines are coalesced into a Map of size <= drainBatchSize
+ * and flushed when full. `.draining.offset` is unused because the upsert is
+ * fully idempotent on replay (sequential batches; last write wins per URL).
  *
  * For crawls, records are flushed in chunks of `drainBatchSize` and the
  * trailing byte offset of the last fully-flushed line is written to
@@ -116,46 +119,75 @@ async function drainOne(db, activePath, collectionName, coalesce) {
     }
   }
 
-  const content = fs.readFileSync(drainingPath, 'utf8');
+  // Stream the file line-by-line. fs.readFileSync of the whole .draining
+  // file used to OOM-kill the container during recovery: a 500 MB JSONL on
+  // disk peaks at ~1.5–2 GB resident once V8's UTF-16 string plus the
+  // .split('\n') array plus JSON.parse transient allocations are accounted
+  // for. With readline, peak memory is bounded by one line plus the current
+  // in-flight batch.
   let written = 0;
 
   if (coalesce) {
-    const latest = new Map();
+    // Coalesce within each flushed batch instead of across the whole file.
+    // The original implementation built a single Map keyed by URL across the
+    // entire file so each unique URL produced exactly one bulkWrite op; that
+    // Map could itself reach hundreds of MB for a saturated domains buffer.
+    // Per-batch coalescing keeps peak memory tiny (drainBatchSize entries)
+    // at the cost of more bulkWrite round trips when the same URL recurs
+    // across distant batches. Final document state is identical: the upsert
+    // is $set keyed on _id=url, and batches are awaited sequentially so the
+    // last-written timestamp wins. Replay idempotency is preserved.
+    const rl = readline.createInterface({
+      input: fs.createReadStream(drainingPath, { encoding: 'utf8' }),
+      crlfDelay: Infinity
+    });
+    const batchMap = new Map();
     let bad = 0;
-    for (const line of content.split('\n')) {
+
+    const flushBatch = async () => {
+      if (batchMap.size === 0) return;
+      const records = Array.from(batchMap, ([url, ts]) => ({ url, ts }));
+      await db.collection(collectionName).bulkWrite(
+        buildDomainTimestampOps(records),
+        { ordered: false }
+      );
+      written += records.length;
+      batchMap.clear();
+    };
+
+    for await (const line of rl) {
       if (!line) continue;
       try {
         const rec = JSON.parse(line);
-        if (rec && rec.url) latest.set(rec.url, rec.ts);
+        if (rec && rec.url) {
+          batchMap.set(rec.url, rec.ts);
+          if (batchMap.size >= drainBatchSize) await flushBatch();
+        }
       } catch (e) {
         bad++;
       }
     }
-    if (bad > 0) console.error(`buffer: skipped ${bad} malformed lines in ${drainingPath}`);
+    await flushBatch();
 
-    const records = Array.from(latest.entries()).map(([url, ts]) => ({ url, ts }));
-    for (let i = 0; i < records.length; i += drainBatchSize) {
-      const chunk = records.slice(i, i + drainBatchSize);
-      const ops = buildDomainTimestampOps(chunk);
-      if (ops.length > 0) {
-        await db.collection(collectionName).bulkWrite(ops, { ordered: false });
-      }
-      written += chunk.length;
-    }
+    if (bad > 0) console.error(`buffer: skipped ${bad} malformed lines in ${drainingPath}`);
     console.log(`buffer: drained ${written} unique URLs to ${collectionName}`);
   } else {
-    const lines = content.split('\n');
+    const rl = readline.createInterface({
+      input: fs.createReadStream(drainingPath, { encoding: 'utf8' }),
+      crlfDelay: Infinity
+    });
     let cursor = 0;
     let batch = [];
     let lastBatchEnd = startOffset;
     let bad = 0;
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
+    for await (const line of rl) {
       const lineStart = cursor;
-      // Each split() entry except the last is followed by a "\n" in the file.
-      const lineBytes = Buffer.byteLength(line, 'utf8') + (i < lines.length - 1 ? 1 : 0);
-      cursor += lineBytes;
+      // readline strips the terminator. Assume '\n' (1 byte). The only case
+      // this is wrong is the file's final line if the file doesn't end with
+      // a newline — corrected by writing the exact file size on the
+      // residual-batch offset below.
+      cursor += Buffer.byteLength(line, 'utf8') + 1;
 
       if (lineStart < startOffset) continue;
       if (!line) continue;
@@ -182,12 +214,12 @@ async function drainOne(db, activePath, collectionName, coalesce) {
       await db.collection(collectionName).bulkWrite(ops, { ordered: false });
       written += batch.length;
       // Persist the offset past the residual batch too. Without this, a
-      // crash between this bulkWrite and the drainingPath unlink below would
-      // cause resumeIncompleteDrain to replay the residual records — which
-      // for crawls means duplicate followups[] entries via $concatArrays.
-      // `cursor` here equals the file size since the for-loop consumed all
-      // lines.
-      fs.writeFileSync(offsetPath, String(cursor));
+      // crash between this bulkWrite and the drainingPath unlink below
+      // would cause resumeIncompleteDrain to replay the residual records —
+      // which for crawls means duplicate followups[] entries via
+      // $concatArrays. Use exact file size to avoid the +1 off-by-one when
+      // the file doesn't end with a newline.
+      fs.writeFileSync(offsetPath, String(fs.statSync(drainingPath).size));
     }
 
     if (bad > 0) console.error(`buffer: skipped ${bad} malformed lines in ${drainingPath}`);
