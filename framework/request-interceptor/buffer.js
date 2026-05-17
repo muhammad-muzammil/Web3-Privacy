@@ -17,8 +17,14 @@
 
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
 const { buildDomainTimestampOps, buildCrawlResultOps } = require('./mongodb.js');
+
+// Hard cap on the size of any single JSONL line, both at write time and at
+// drain time. Lines above this cap cannot be stored in MongoDB anyway
+// (the BSON document limit is 16 MiB), and trying to load one as a single
+// V8 string blows the heap. Anything larger is dropped with a warning.
+// 12 MiB leaves headroom for BSON overhead under the Mongo 16 MiB ceiling.
+const MAX_LINE_BYTES = 12 * 1024 * 1024;
 
 let bufferDir = null;
 let instanceId = null;
@@ -50,7 +56,106 @@ function appendDomainTimestamp(url) {
 
 function appendCrawlResult(doc) {
   const line = JSON.stringify(doc) + '\n';
+  // Defense at the source: a single crawl record with a giant pageSrc or
+  // responseBody can produce a line larger than the Mongo doc limit, which
+  // would then OOM the drain on read-back (no streaming line reader can
+  // emit a line without holding it in one string). Drop oversized records
+  // with a loud warning so the operator notices.
+  if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+    console.error(`buffer: dropping oversized crawl record url=${doc && doc.url} size=${line.length}B (cap=${MAX_LINE_BYTES}B)`);
+    return;
+  }
   fs.appendFileSync(crawlsActivePath, line);
+}
+
+/**
+ * Bounded raw-byte line streamer. Reads the file in chunks of `chunkBytes`,
+ * splits on `\n` (0x0a) without ever materializing more than ~maxLineBytes
+ * in memory, and yields one record per line:
+ *
+ *   { oversized: false, line: <string>, lineStart, lineEnd }
+ *   { oversized: true,  line: null,     lineStart, lineEnd }
+ *
+ * `lineStart` is the file byte offset of the first byte of the line.
+ * `lineEnd`   is the file byte offset just past the terminating `\n`
+ *             (or end-of-file for a trailing newline-less line).
+ *
+ * Lines larger than maxLineBytes — whether through pathological payloads or
+ * file corruption — are skipped without ever building the full string.
+ * They still consume their byte range, so caller offset tracking stays
+ * correct against the on-disk file.
+ */
+async function* streamLines(filePath, maxLineBytes) {
+  const stream = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+  let leftover = null;        // Buffer holding incomplete trailing bytes
+  let leftoverStart = 0;      // file offset where `leftover` begins
+  let pos = 0;                // total bytes pulled from the file so far
+  let skipping = false;       // true while discarding bytes of an oversized line
+  let skipStart = 0;          // file offset where the current skip began
+
+  for await (const chunk of stream) {
+    let buf;
+    let bufStart;
+    if (leftover) {
+      buf = Buffer.concat([leftover, chunk]);
+      bufStart = leftoverStart;
+      leftover = null;
+    } else {
+      buf = chunk;
+      bufStart = pos;
+    }
+    pos = bufStart + buf.length;
+
+    let i = 0;
+    while (i < buf.length) {
+      const nl = buf.indexOf(0x0a, i);
+      if (nl === -1) break;
+
+      if (skipping) {
+        yield { oversized: true, line: null, lineStart: skipStart, lineEnd: bufStart + nl + 1 };
+        skipping = false;
+      } else if ((nl - i) > maxLineBytes) {
+        yield { oversized: true, line: null, lineStart: bufStart + i, lineEnd: bufStart + nl + 1 };
+      } else {
+        yield {
+          oversized: false,
+          line: buf.slice(i, nl).toString('utf8'),
+          lineStart: bufStart + i,
+          lineEnd: bufStart + nl + 1
+        };
+      }
+      i = nl + 1;
+    }
+
+    const remainderLen = buf.length - i;
+    if (skipping) {
+      // Drop the unterminated tail; we're already mid-skip.
+    } else if (remainderLen > maxLineBytes) {
+      // No newline yet and we've already buffered more than allowed.
+      // Enter skip mode; the bytes already in `buf` are discarded.
+      skipping = true;
+      skipStart = bufStart + i;
+    } else if (remainderLen > 0) {
+      leftover = buf.slice(i);
+      leftoverStart = bufStart + i;
+    }
+  }
+
+  // EOF — emit any tail
+  if (skipping) {
+    yield { oversized: true, line: null, lineStart: skipStart, lineEnd: pos };
+  } else if (leftover) {
+    if (leftover.length > maxLineBytes) {
+      yield { oversized: true, line: null, lineStart: leftoverStart, lineEnd: pos };
+    } else {
+      yield {
+        oversized: false,
+        line: leftover.toString('utf8'),
+        lineStart: leftoverStart,
+        lineEnd: pos
+      };
+    }
+  }
 }
 
 function fileSize(p) {
@@ -119,12 +224,12 @@ async function drainOne(db, activePath, collectionName, coalesce) {
     }
   }
 
-  // Stream the file line-by-line. fs.readFileSync of the whole .draining
-  // file used to OOM-kill the container during recovery: a 500 MB JSONL on
-  // disk peaks at ~1.5–2 GB resident once V8's UTF-16 string plus the
-  // .split('\n') array plus JSON.parse transient allocations are accounted
-  // for. With readline, peak memory is bounded by one line plus the current
-  // in-flight batch.
+  // Stream the file with a bounded raw-byte reader (streamLines). The
+  // earlier readline-based version still OOMed on files containing a
+  // single pathologically large line (one ~500 MB crawl record): readline
+  // accumulates bytes between newlines into one V8 string before emitting,
+  // and that string allocation blew the heap with a SIGABRT (exit 134).
+  // streamLines caps each line at MAX_LINE_BYTES and skips anything bigger.
   let written = 0;
 
   if (coalesce) {
@@ -137,12 +242,9 @@ async function drainOne(db, activePath, collectionName, coalesce) {
     // across distant batches. Final document state is identical: the upsert
     // is $set keyed on _id=url, and batches are awaited sequentially so the
     // last-written timestamp wins. Replay idempotency is preserved.
-    const rl = readline.createInterface({
-      input: fs.createReadStream(drainingPath, { encoding: 'utf8' }),
-      crlfDelay: Infinity
-    });
     const batchMap = new Map();
     let bad = 0;
+    let oversized = 0;
 
     const flushBatch = async () => {
       if (batchMap.size === 0) return;
@@ -155,10 +257,11 @@ async function drainOne(db, activePath, collectionName, coalesce) {
       batchMap.clear();
     };
 
-    for await (const line of rl) {
-      if (!line) continue;
+    for await (const item of streamLines(drainingPath, MAX_LINE_BYTES)) {
+      if (item.oversized) { oversized++; continue; }
+      if (!item.line) continue;
       try {
-        const rec = JSON.parse(line);
+        const rec = JSON.parse(item.line);
         if (rec && rec.url) {
           batchMap.set(rec.url, rec.ts);
           if (batchMap.size >= drainBatchSize) await flushBatch();
@@ -170,30 +273,27 @@ async function drainOne(db, activePath, collectionName, coalesce) {
     await flushBatch();
 
     if (bad > 0) console.error(`buffer: skipped ${bad} malformed lines in ${drainingPath}`);
+    if (oversized > 0) console.error(`buffer: skipped ${oversized} oversized (>${MAX_LINE_BYTES}B) lines in ${drainingPath}`);
     console.log(`buffer: drained ${written} unique URLs to ${collectionName}`);
   } else {
-    const rl = readline.createInterface({
-      input: fs.createReadStream(drainingPath, { encoding: 'utf8' }),
-      crlfDelay: Infinity
-    });
-    let cursor = 0;
     let batch = [];
     let lastBatchEnd = startOffset;
     let bad = 0;
+    let oversized = 0;
+    // Tracks the byte offset just past the last fully-emitted line. Used as
+    // the offset-sidecar value after each bulkWrite. streamLines yields
+    // exact byte ranges, so we never have to guess `+1` for the terminator.
+    let cursorEnd = 0;
 
-    for await (const line of rl) {
-      const lineStart = cursor;
-      // readline strips the terminator. Assume '\n' (1 byte). The only case
-      // this is wrong is the file's final line if the file doesn't end with
-      // a newline — corrected by writing the exact file size on the
-      // residual-batch offset below.
-      cursor += Buffer.byteLength(line, 'utf8') + 1;
+    for await (const item of streamLines(drainingPath, MAX_LINE_BYTES)) {
+      cursorEnd = item.lineEnd;
 
-      if (lineStart < startOffset) continue;
-      if (!line) continue;
+      if (item.lineStart < startOffset) continue;
+      if (item.oversized) { oversized++; continue; }
+      if (!item.line) continue;
 
       try {
-        batch.push(JSON.parse(line));
+        batch.push(JSON.parse(item.line));
       } catch (e) {
         bad++;
         continue;
@@ -203,7 +303,7 @@ async function drainOne(db, activePath, collectionName, coalesce) {
         const ops = buildCrawlResultOps(batch);
         await db.collection(collectionName).bulkWrite(ops, { ordered: false });
         written += batch.length;
-        lastBatchEnd = cursor;
+        lastBatchEnd = cursorEnd;
         fs.writeFileSync(offsetPath, String(lastBatchEnd));
         batch = [];
       }
@@ -217,12 +317,12 @@ async function drainOne(db, activePath, collectionName, coalesce) {
       // crash between this bulkWrite and the drainingPath unlink below
       // would cause resumeIncompleteDrain to replay the residual records —
       // which for crawls means duplicate followups[] entries via
-      // $concatArrays. Use exact file size to avoid the +1 off-by-one when
-      // the file doesn't end with a newline.
+      // $concatArrays. Use exact file size to be definitive.
       fs.writeFileSync(offsetPath, String(fs.statSync(drainingPath).size));
     }
 
     if (bad > 0) console.error(`buffer: skipped ${bad} malformed lines in ${drainingPath}`);
+    if (oversized > 0) console.error(`buffer: skipped ${oversized} oversized (>${MAX_LINE_BYTES}B) lines in ${drainingPath}`);
     console.log(`buffer: drained ${written} records to ${collectionName}`);
   }
 
