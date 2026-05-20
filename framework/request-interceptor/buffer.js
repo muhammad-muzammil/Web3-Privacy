@@ -249,10 +249,13 @@ async function drainOne(db, activePath, collectionName, coalesce) {
     const flushBatch = async () => {
       if (batchMap.size === 0) return;
       const records = Array.from(batchMap, ([url, ts]) => ({ url, ts }));
+      console.log(`buffer: inserting ${records.length} ${collectionName} records (bulkWrite start)`);
+      const t0 = Date.now();
       await db.collection(collectionName).bulkWrite(
         buildDomainTimestampOps(records),
         { ordered: false }
       );
+      console.log(`buffer: ${collectionName} bulkWrite done (${records.length} records, ${Date.now() - t0}ms)`);
       written += records.length;
       batchMap.clear();
     };
@@ -301,7 +304,10 @@ async function drainOne(db, activePath, collectionName, coalesce) {
 
       if (batch.length >= drainBatchSize) {
         const ops = buildCrawlResultOps(batch);
+        console.log(`buffer: inserting ${batch.length} ${collectionName} records (bulkWrite start, ${written} done so far)`);
+        const t0 = Date.now();
         await db.collection(collectionName).bulkWrite(ops, { ordered: false });
+        console.log(`buffer: ${collectionName} bulkWrite done (${batch.length} records, ${Date.now() - t0}ms)`);
         written += batch.length;
         lastBatchEnd = cursorEnd;
         fs.writeFileSync(offsetPath, String(lastBatchEnd));
@@ -311,7 +317,10 @@ async function drainOne(db, activePath, collectionName, coalesce) {
 
     if (batch.length > 0) {
       const ops = buildCrawlResultOps(batch);
+      console.log(`buffer: inserting final ${batch.length} ${collectionName} records (bulkWrite start)`);
+      const t0 = Date.now();
       await db.collection(collectionName).bulkWrite(ops, { ordered: false });
+      console.log(`buffer: ${collectionName} bulkWrite done (${batch.length} records, ${Date.now() - t0}ms)`);
       written += batch.length;
       // Persist the offset past the residual batch too. Without this, a
       // crash between this bulkWrite and the drainingPath unlink below
