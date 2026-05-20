@@ -20,7 +20,16 @@ async function initDb() {
   connectionString += dbHost;
 
   try {
-    const client = new MongoClient(connectionString, { authSource: 'admin' });
+    const client = new MongoClient(connectionString, {
+      authSource: 'admin',
+      // Without these, socketTimeoutMS defaults to infinite: a bulkWrite against
+      // an unresponsive server never returns, which permanently pauses the
+      // consumer mid-drain. Bound every connection-level wait so operations
+      // error out (and get retried by buffer.bulkWriteWithRetry) instead.
+      serverSelectionTimeoutMS: parseInt(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || '10000', 10),
+      connectTimeoutMS: parseInt(process.env.MONGO_CONNECT_TIMEOUT_MS || '10000', 10),
+      socketTimeoutMS: parseInt(process.env.MONGO_SOCKET_TIMEOUT_MS || '60000', 10),
+    });
     await client.connect();
     await client.db('admin').command({ ping: 1 });
     db = client.db(dbName);

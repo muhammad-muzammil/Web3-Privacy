@@ -40,7 +40,36 @@ const BUFFER_FLUSH_SIZE_MB = parseInt(process.env.BUFFER_FLUSH_SIZE_MB || '500',
 const DRAIN_BATCH_SIZE = parseInt(process.env.DRAIN_BATCH_SIZE || '500', 10);
 const DEBUG_LEVEL = process.env.DEBUG_LEVEL || 'none';
 const MAX_CRAWL_RETRIES = 1;
+// Hard wall-clock budgets for Puppeteer/CDP browser ops that otherwise have no
+// timeout. A wedged Chrome makes these CDP round-trips never return, which
+// permanently stalls the single-flight consume loop. On expiry we SIGKILL the
+// Chrome process and rebuild the session.
+const LAUNCH_TIMEOUT_MS = parseInt(process.env.LAUNCH_TIMEOUT_MS || '60000', 10);
+const BROWSER_CLOSE_TIMEOUT_MS = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS || '15000', 10);
+const BROWSER_OP_TIMEOUT_MS = parseInt(process.env.BROWSER_OP_TIMEOUT_MS || '10000', 10);
 var session_dead = false;
+
+// Race a promise against a wall-clock timeout that rejects. Used to bound
+// otherwise-unbounded Puppeteer/CDP awaits so a wedged Chrome cannot freeze
+// the consume loop. The underlying op may keep running after a timeout; that
+// leak is acceptable versus a permanent stall.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Best-effort SIGKILL of the Chrome process behind a (possibly wedged) browser.
+// browser.close() going through CDP can itself hang, so we go straight to the
+// OS process when a browser op times out.
+function forceKill(browser) {
+  try {
+    const proc = browser && browser.process && browser.process();
+    if (proc) proc.kill('SIGKILL');
+  } catch (e) { /* ignore */ }
+}
 
 const logger = chromeLoggerLib.getLoggerForLevel(DEBUG_LEVEL);
 
@@ -124,7 +153,24 @@ async function startBrowser() {
     printFrameHierarchy: false,
   };
 
-  const browser = await chromePuppeteerLib.launch(args);
+  // Bounded launch retry: a launch that hangs would otherwise stall the
+  // consume loop forever. Time-box each attempt; force-kill any half-spawned
+  // process and retry, then give up after a few tries (the caller runs inside
+  // pullOne's try/catch, so a thrown launch commits the message and keeps the
+  // loop alive rather than wedging it).
+  let browser;
+  const LAUNCH_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= LAUNCH_ATTEMPTS; attempt++) {
+    try {
+      browser = await withTimeout(chromePuppeteerLib.launch(args), LAUNCH_TIMEOUT_MS, 'browser.launch');
+      break;
+    } catch (e) {
+      console.error(`browser launch attempt ${attempt}/${LAUNCH_ATTEMPTS} failed: ${e.message}`);
+      forceKill(browser);
+      if (attempt === LAUNCH_ATTEMPTS) throw e;
+      await sleep(1000 * Math.pow(2, attempt - 1));
+    }
+  }
   browser.on('disconnected', () => { session_dead = true; });
 
   // Set up the targetcreated handler for network capture
@@ -243,7 +289,7 @@ async function startBrowser() {
 
   // Wait for MetaMask extension to load, then import wallet
   await sleep(2500);
-  const pages = await browser.pages();
+  const pages = await withTimeout(browser.pages(), BROWSER_OP_TIMEOUT_MS, 'browser.pages(startBrowser)');
   if (pages.length > 1) {
     const wallet = pages[pages.length - 1];
     await wallet.bringToFront();
@@ -266,7 +312,14 @@ async function startBrowser() {
  */
 async function destroySession(session) {
   if (!session) return;
-  try { await session.browser.close(); } catch (e) { /* ignore */ }
+  try {
+    await withTimeout(session.browser.close(), BROWSER_CLOSE_TIMEOUT_MS, 'browser.close');
+  } catch (e) {
+    // close() hung or threw — go straight to the OS process so a wedged Chrome
+    // can't keep the consume loop blocked.
+    console.error(`browser.close failed (${e.message}) — force-killing Chrome process`);
+    forceKill(session.browser);
+  }
   if (session.profilePath) {
     try {
       fs.rmSync(session.profilePath, { recursive: true, force: true });
@@ -332,14 +385,21 @@ async function crawlUrlBounded(session, url, args, logger, ms) {
     logger.debug(`crawlUrl rejected for ${url} (${firstLine}) — closing pages and returning partial capture`);
   }
   try {
-    const pages = await session.browser.pages();
+    const pages = await withTimeout(session.browser.pages(), BROWSER_OP_TIMEOUT_MS, 'browser.pages(cleanup)');
     for (const p of pages) {
       const u = p.url() || '';
       if (!u.startsWith('chrome-extension://') && !u.startsWith('about:')) {
-        try { await p.close({ runBeforeUnload: false }); } catch (e) {}
+        try { await withTimeout(p.close({ runBeforeUnload: false }), BROWSER_OP_TIMEOUT_MS, 'page.close'); } catch (e) {}
       }
     }
-  } catch (e) {}
+  } catch (e) {
+    // A timed-out pages()/close() means Chrome is wedged. Kill the process and
+    // flag the session dead so the next message rebuilds a fresh browser
+    // (handled by the session-refresh block in processMessage).
+    logger.debug(`cleanup browser op failed (${e.message}) — force-killing Chrome and marking session dead`);
+    forceKill(session.browser);
+    session_dead = true;
+  }
 
   return {
     url,
@@ -400,7 +460,9 @@ async function main() {
     bufferDir: BUFFER_DIR,
     instanceId: GROUP_INSTANCE_ID,
     flushThresholdBytes: BUFFER_FLUSH_SIZE_MB * 1024 * 1024,
-    drainBatchSize: DRAIN_BATCH_SIZE
+    drainBatchSize: DRAIN_BATCH_SIZE,
+    drainWriteTimeoutMs: parseInt(process.env.BULK_WRITE_TIMEOUT_MS || '30000', 10),
+    drainWriteRetries: parseInt(process.env.BULK_WRITE_RETRIES || '3', 10)
   });
   // Finish any drain that was in progress when a previous run died. Runs
   // before we accept any new messages so a partly-flushed `.draining` file

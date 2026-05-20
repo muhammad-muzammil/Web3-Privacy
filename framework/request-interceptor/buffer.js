@@ -30,6 +30,8 @@ let bufferDir = null;
 let instanceId = null;
 let flushThresholdBytes = 0;
 let drainBatchSize = 500;
+let drainWriteTimeoutMs = 30000;
+let drainWriteRetries = 3;
 let domainsActivePath = null;
 let crawlsActivePath = null;
 
@@ -39,6 +41,12 @@ function init(opts) {
   flushThresholdBytes = opts.flushThresholdBytes;
   if (typeof opts.drainBatchSize === 'number' && opts.drainBatchSize > 0) {
     drainBatchSize = opts.drainBatchSize;
+  }
+  if (typeof opts.drainWriteTimeoutMs === 'number' && opts.drainWriteTimeoutMs > 0) {
+    drainWriteTimeoutMs = opts.drainWriteTimeoutMs;
+  }
+  if (typeof opts.drainWriteRetries === 'number' && opts.drainWriteRetries >= 0) {
+    drainWriteRetries = opts.drainWriteRetries;
   }
 
   fs.mkdirSync(bufferDir, { recursive: true });
@@ -167,6 +175,53 @@ function fileSize(p) {
   }
 }
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Run a bulkWrite with a per-attempt timeout and bounded retries. Two layers
+ * of timeout guard against the original hang (a bulkWrite that never returns
+ * against an unresponsive Mongo, which permanently pauses the consumer):
+ *   1. per-operation `timeoutMS` (driver CSOT) aborts the op client-side;
+ *   2. a hard Promise.race backstop (timeoutMS + 5s) rejects even if the
+ *      driver's own timeout fails to fire. The underlying op may leak, which
+ *      is acceptable — better a leaked op than a wedged consumer.
+ * On every attempt failure we back off (1s, 2s, 4s, …) and retry. After the
+ * last attempt we throw so the caller (drainOne → drain → runDrainPhase)
+ * logs it and resumes the consumer; the `.draining` file persists for replay.
+ */
+async function bulkWriteWithRetry(db, collectionName, ops, label) {
+  const totalAttempts = drainWriteRetries + 1;
+  let lastErr;
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    try {
+      let hardTimer;
+      const hardTimeout = new Promise((_, rej) => {
+        hardTimer = setTimeout(
+          () => rej(new Error(`bulkWrite hard timeout after ${drainWriteTimeoutMs + 5000}ms`)),
+          drainWriteTimeoutMs + 5000
+        );
+      });
+      try {
+        await Promise.race([
+          db.collection(collectionName).bulkWrite(ops, { ordered: false, timeoutMS: drainWriteTimeoutMs }),
+          hardTimeout
+        ]);
+      } finally {
+        clearTimeout(hardTimer);
+      }
+      return;
+    } catch (e) {
+      lastErr = e;
+      const msg = e && e.message ? e.message : String(e);
+      console.error(`buffer: ${label} bulkWrite attempt ${attempt}/${totalAttempts} failed: ${msg}`);
+      if (attempt < totalAttempts) {
+        await sleep(1000 * Math.pow(2, attempt - 1));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 function shouldDrain() {
   return fileSize(domainsActivePath) >= flushThresholdBytes ||
          fileSize(crawlsActivePath) >= flushThresholdBytes;
@@ -251,10 +306,7 @@ async function drainOne(db, activePath, collectionName, coalesce) {
       const records = Array.from(batchMap, ([url, ts]) => ({ url, ts }));
       console.log(`buffer: inserting ${records.length} ${collectionName} records (bulkWrite start)`);
       const t0 = Date.now();
-      await db.collection(collectionName).bulkWrite(
-        buildDomainTimestampOps(records),
-        { ordered: false }
-      );
+      await bulkWriteWithRetry(db, collectionName, buildDomainTimestampOps(records), collectionName);
       console.log(`buffer: ${collectionName} bulkWrite done (${records.length} records, ${Date.now() - t0}ms)`);
       written += records.length;
       batchMap.clear();
@@ -306,7 +358,7 @@ async function drainOne(db, activePath, collectionName, coalesce) {
         const ops = buildCrawlResultOps(batch);
         console.log(`buffer: inserting ${batch.length} ${collectionName} records (bulkWrite start, ${written} done so far)`);
         const t0 = Date.now();
-        await db.collection(collectionName).bulkWrite(ops, { ordered: false });
+        await bulkWriteWithRetry(db, collectionName, ops, collectionName);
         console.log(`buffer: ${collectionName} bulkWrite done (${batch.length} records, ${Date.now() - t0}ms)`);
         written += batch.length;
         lastBatchEnd = cursorEnd;
@@ -319,7 +371,7 @@ async function drainOne(db, activePath, collectionName, coalesce) {
       const ops = buildCrawlResultOps(batch);
       console.log(`buffer: inserting final ${batch.length} ${collectionName} records (bulkWrite start)`);
       const t0 = Date.now();
-      await db.collection(collectionName).bulkWrite(ops, { ordered: false });
+      await bulkWriteWithRetry(db, collectionName, ops, collectionName);
       console.log(`buffer: ${collectionName} bulkWrite done (${batch.length} records, ${Date.now() - t0}ms)`);
       written += batch.length;
       // Persist the offset past the residual batch too. Without this, a
