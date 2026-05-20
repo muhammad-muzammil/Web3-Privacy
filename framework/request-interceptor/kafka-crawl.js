@@ -673,9 +673,13 @@ async function main() {
       const matchedAddresses = [];
 
       for (const req of allMapped) {
+        const endpoint = req.endpoint || '';
+        // data: URIs are inline blobs (base64 images, etc.) with no host;
+        // their payload spuriously matches the address regexes.
+        if (endpoint.startsWith('data:')) continue;
         //skip request if it's made to a known safe endpoint
-        if (isSafeEndpoint(req.endpoint || '')) continue;
-        const urlScan = scanText(req.endpoint || '', urlTerms, falseFlags);
+        if (isSafeEndpoint(endpoint)) continue;
+        const urlScan = scanText(endpoint, urlTerms, falseFlags);
         const reqScan = scanText(req.requestBody || '', searchTerms, falseFlags);
         const respScan = scanText(req.responseBody || '', searchTerms, falseFlags);
         if (urlScan.interesting || reqScan.interesting || respScan.interesting) {
