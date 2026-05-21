@@ -76,30 +76,34 @@ async function insertCrawlResult(url, redirectedUrl, accessedDate, status, pageS
   };
 
   try {
+    // See buildCrawlResultOps: serialize the payload once via a temp field to
+    // keep the BSON command ~1× the record instead of ~2×.
     const result = await db.collection('crawls').updateOne(
       { url },
       [
+        { $set: { __incoming: crawlData } },
         {
           $set: {
             url: { $ifNull: ['$url', url] },
-            redirectedUrl: { $ifNull: ['$redirectedUrl', redirectedUrl] },
-            accessedDate: { $ifNull: ['$accessedDate', accessedDate] },
-            status: { $ifNull: ['$status', status] },
-            pageSrc: { $ifNull: ['$pageSrc', pageSrc] },
-            additionalRequests: { $ifNull: ['$additionalRequests', additionalRequests] },
-            interactions: { $ifNull: ['$interactions', interactions] },
-            matchedAddresses: {$ifNull: ['$matchedAddresses', matchedAddresses]},
-            evalScripts: { $ifNull: ['$evalScripts', evalScripts] },
-            crawlerVersion: crawlerVersion,
+            redirectedUrl: { $ifNull: ['$redirectedUrl', '$__incoming.redirectedUrl'] },
+            accessedDate: { $ifNull: ['$accessedDate', '$__incoming.accessedDate'] },
+            status: { $ifNull: ['$status', '$__incoming.status'] },
+            pageSrc: { $ifNull: ['$pageSrc', '$__incoming.pageSrc'] },
+            additionalRequests: { $ifNull: ['$additionalRequests', '$__incoming.additionalRequests'] },
+            interactions: { $ifNull: ['$interactions', '$__incoming.interactions'] },
+            matchedAddresses: {$ifNull: ['$matchedAddresses', '$__incoming.matchedAddresses']},
+            evalScripts: { $ifNull: ['$evalScripts', '$__incoming.evalScripts'] },
+            crawlerVersion: '$__incoming.crawlerVersion',
             followups: {
               $cond: {
                 if: { $isArray: '$followups' },
-                then: { $concatArrays: ['$followups', [crawlData]] },
+                then: { $concatArrays: ['$followups', ['$__incoming']] },
                 else: []
               }
             }
           }
-        }
+        },
+        { $unset: '__incoming' }
       ],
       { upsert: true }
     );
@@ -245,31 +249,39 @@ function buildCrawlResultOps(records) {
       evalScripts: rec.evalScripts,
       crawlerVersion: rec.crawlerVersion
     };
+    // Stash the incoming record in a temp field so its (potentially multi-MB)
+    // payload is serialized into the command exactly ONCE, then reference it
+    // everywhere else and unset it before the doc is written. The earlier shape
+    // embedded every large field twice (top-level $ifNull AND inside crawlData),
+    // doubling the BSON command size and tripping the 16 MiB limit on records
+    // that were themselves well under it. Semantics are unchanged.
     return {
       updateOne: {
         filter: { url: rec.url },
         update: [
+          { $set: { __incoming: crawlData } },
           {
             $set: {
               url: { $ifNull: ['$url', rec.url] },
-              redirectedUrl: { $ifNull: ['$redirectedUrl', rec.redirectedUrl] },
-              accessedDate: { $ifNull: ['$accessedDate', accessedDate] },
-              status: { $ifNull: ['$status', rec.status] },
-              pageSrc: { $ifNull: ['$pageSrc', rec.pageSrc] },
-              additionalRequests: { $ifNull: ['$additionalRequests', rec.additionalRequests] },
-              interactions: { $ifNull: ['$interactions', rec.interactions] },
-              matchedAddresses: { $ifNull: ['$matchedAddresses', rec.matchedAddresses] },
-              evalScripts: { $ifNull: ['$evalScripts', rec.evalScripts] },
-              crawlerVersion: rec.crawlerVersion,
+              redirectedUrl: { $ifNull: ['$redirectedUrl', '$__incoming.redirectedUrl'] },
+              accessedDate: { $ifNull: ['$accessedDate', '$__incoming.accessedDate'] },
+              status: { $ifNull: ['$status', '$__incoming.status'] },
+              pageSrc: { $ifNull: ['$pageSrc', '$__incoming.pageSrc'] },
+              additionalRequests: { $ifNull: ['$additionalRequests', '$__incoming.additionalRequests'] },
+              interactions: { $ifNull: ['$interactions', '$__incoming.interactions'] },
+              matchedAddresses: { $ifNull: ['$matchedAddresses', '$__incoming.matchedAddresses'] },
+              evalScripts: { $ifNull: ['$evalScripts', '$__incoming.evalScripts'] },
+              crawlerVersion: '$__incoming.crawlerVersion',
               followups: {
                 $cond: {
                   if: { $isArray: '$followups' },
-                  then: { $concatArrays: ['$followups', [crawlData]] },
+                  then: { $concatArrays: ['$followups', ['$__incoming']] },
                   else: []
                 }
               }
             }
-          }
+          },
+          { $unset: '__incoming' }
         ],
         upsert: true
       }

@@ -177,6 +177,75 @@ function fileSize(p) {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// A document/op that exceeds Mongo's 16 MiB BSON limit. This is deterministic
+// — retrying never helps — so we isolate and drop it rather than wedging the
+// drain. Covers the client-side serialize error ("Document is larger than the
+// maximum size 16777216", code 10334) and the server-side resulting-doc error
+// (code 17419).
+function isOversizeError(e) {
+  if (!e) return false;
+  if (e.code === 10334 || e.code === 17419) return true;
+  const msg = e.message ? e.message : String(e);
+  return /larger than the maximum size|BSONObjectTooLarge|resulting document.*larger/i.test(msg);
+}
+
+function oversizedLogPath(collectionName) {
+  return path.join(bufferDir, `${instanceId}-${collectionName}.oversized.jsonl`);
+}
+
+// Single bulkWrite attempt with a per-op `timeoutMS` (driver CSOT) plus a hard
+// Promise.race backstop (timeoutMS + 5s) in case the driver's own timeout fails
+// to fire. A leaked underlying op is acceptable versus a wedged consumer.
+async function bulkWriteOnce(db, collectionName, ops) {
+  let hardTimer;
+  const hardTimeout = new Promise((_, rej) => {
+    hardTimer = setTimeout(
+      () => rej(new Error(`bulkWrite hard timeout after ${drainWriteTimeoutMs + 5000}ms`)),
+      drainWriteTimeoutMs + 5000
+    );
+  });
+  try {
+    await Promise.race([
+      db.collection(collectionName).bulkWrite(ops, { ordered: false, timeoutMS: drainWriteTimeoutMs }),
+      hardTimeout
+    ]);
+  } finally {
+    clearTimeout(hardTimer);
+  }
+}
+
+// Fallback when a batch hits the BSON size limit: write each op individually so
+// the good records still land and only the oversized one(s) are dropped (they
+// can never be stored in Mongo regardless). Dropped records are logged and
+// appended to a `.oversized.jsonl` sidecar for audit. A non-oversize error on a
+// single op is rethrown so the outer drain fails and the `.draining` file
+// replays as usual.
+async function drainPerOpDroppingOversized(db, collectionName, ops, label) {
+  let ok = 0;
+  let dropped = 0;
+  for (const op of ops) {
+    try {
+      await bulkWriteOnce(db, collectionName, [op]);
+      ok++;
+    } catch (e) {
+      if (!isOversizeError(e)) throw e;
+      const filter = (op.updateOne && op.updateOne.filter) || {};
+      const url = filter.url || filter._id || '<unknown>';
+      console.error(`buffer: dropping oversized ${label} record url=${url} (exceeds 16MiB BSON limit)`);
+      try {
+        fs.appendFileSync(
+          oversizedLogPath(collectionName),
+          JSON.stringify({ url, ts: new Date().toISOString(), label }) + '\n'
+        );
+      } catch (logErr) {
+        console.error(`buffer: failed to record oversized ${label} url=${url}: ${logErr.message}`);
+      }
+      dropped++;
+    }
+  }
+  console.error(`buffer: ${label} per-op fallback complete (${ok} written, ${dropped} dropped oversized)`);
+}
+
 /**
  * Run a bulkWrite with a per-attempt timeout and bounded retries. Two layers
  * of timeout guard against the original hang (a bulkWrite that never returns
@@ -185,32 +254,26 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
  *   2. a hard Promise.race backstop (timeoutMS + 5s) rejects even if the
  *      driver's own timeout fails to fire. The underlying op may leak, which
  *      is acceptable — better a leaked op than a wedged consumer.
- * On every attempt failure we back off (1s, 2s, 4s, …) and retry. After the
- * last attempt we throw so the caller (drainOne → drain → runDrainPhase)
- * logs it and resumes the consumer; the `.draining` file persists for replay.
+ * A BSON size-limit error is deterministic, so instead of retrying we fall back
+ * to per-op writes that drop the oversized record (see
+ * drainPerOpDroppingOversized). On other failures we back off (1s, 2s, 4s, …)
+ * and retry; after the last attempt we throw so the caller (drainOne → drain →
+ * runDrainPhase) logs it and resumes the consumer, leaving the `.draining` file
+ * for replay.
  */
 async function bulkWriteWithRetry(db, collectionName, ops, label) {
   const totalAttempts = drainWriteRetries + 1;
   let lastErr;
   for (let attempt = 1; attempt <= totalAttempts; attempt++) {
     try {
-      let hardTimer;
-      const hardTimeout = new Promise((_, rej) => {
-        hardTimer = setTimeout(
-          () => rej(new Error(`bulkWrite hard timeout after ${drainWriteTimeoutMs + 5000}ms`)),
-          drainWriteTimeoutMs + 5000
-        );
-      });
-      try {
-        await Promise.race([
-          db.collection(collectionName).bulkWrite(ops, { ordered: false, timeoutMS: drainWriteTimeoutMs }),
-          hardTimeout
-        ]);
-      } finally {
-        clearTimeout(hardTimer);
-      }
+      await bulkWriteOnce(db, collectionName, ops);
       return;
     } catch (e) {
+      if (isOversizeError(e)) {
+        console.error(`buffer: ${label} batch hit BSON size limit — retrying per-op to isolate oversized records`);
+        await drainPerOpDroppingOversized(db, collectionName, ops, label);
+        return;
+      }
       lastErr = e;
       const msg = e && e.message ? e.message : String(e);
       console.error(`buffer: ${label} bulkWrite attempt ${attempt}/${totalAttempts} failed: ${msg}`);
